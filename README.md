@@ -1,4 +1,5 @@
 # ⚽ soccerGSR: Game State Reconstruction in Soccer
+Реконструкция игровых состояний футбольного матча
 
 ![Status](https://img.shields.io/badge/status-in%20progress-green)
 ![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
