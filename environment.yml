@@ -1,0 +1,12 @@
+name: soccer_eda
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pandas
+  - jupyterlab
+  - matplotlib
+  - opencv
+  - seaborn
+  - scikit-learn
+prefix: /home/dxdxxd/miniconda3/envs/gsr_eda
