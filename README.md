@@ -21,6 +21,8 @@ pip install -r requirements.txt
 Для работы необходим датасет **SoccerNet Game State Reconstruction**.
 
 **Скачать датасет:**
+https://disk.360.yandex.ru/d/CJDIWx1TFLYpxA
+Содержимое положить в директорию data внутри основной директории 
 
 ### Множественные форматы
 ```
@@ -45,3 +47,4 @@ python convert_labels.py --format coco yolo --copy-images
   - Готов для бенчмарка MOT Challenge
 
 Подробный анализ датасета находится в ноутбуке **`notebooks/eda.ipynb`**
+
