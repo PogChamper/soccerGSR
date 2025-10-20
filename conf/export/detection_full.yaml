@@ -1,0 +1,36 @@
+# Export Configuration: Full Detection Dataset
+
+name: detection_full
+
+dataset_tags:
+  - gsr
+  - sportsmot
+  - socceryolo
+
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+splits:
+  - train
+  - valid
+  - test
+
+subsample_configs:
+  gsr:
+    enabled: true
+    frame_interval: 25  # 1 FPS
+  sportsmot:
+    enabled: true
+    frame_interval: 25  # 1 FPS
+  socceryolo:
+    enabled: false  # Images
+
+formats:
+  - yolo
+  - coco
+
+output_dir: exports2
+

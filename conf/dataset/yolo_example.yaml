@@ -1,0 +1,12 @@
+# Example YOLO dataset configuration
+
+type: yolo
+tag: my_yolo_dataset
+path: /path/to/yolo/data
+splits: [train, valid]
+class_mapping:
+  "0": ball
+  "1": goalkeeper
+  "2": player
+  "3": referee
+

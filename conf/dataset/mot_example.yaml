@@ -1,0 +1,7 @@
+# Example MOT dataset configuration
+
+type: mot_frames
+tag: my_mot_dataset
+path: /path/to/mot/data
+splits: [train, valid]
+

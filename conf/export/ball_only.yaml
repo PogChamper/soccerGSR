@@ -1,0 +1,29 @@
+# Export Configuration: Ball Detection Only
+# Only export ball class from GSR and socceryolo datasets
+
+name: ball_only
+
+dataset_tags:
+  - gsr
+  - socceryolo
+
+classes:
+  - ball  # Only ball class
+
+splits:
+  - train
+  - valid
+
+subsample_configs:
+  gsr:
+    enabled: true
+    frame_interval: 25  # Every 25th frame = 1 FPS
+  socceryolo:
+    enabled: false  # Images, no subsampling
+
+formats:
+  - yolo
+  - coco
+
+output_dir: 03_exports
+

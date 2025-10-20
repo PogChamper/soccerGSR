@@ -1,0 +1,12 @@
+# Hydra Configuration for Unified Export
+
+defaults:
+  - export: detection_full  # Default export configuration
+
+# Hub configuration
+hub:
+  name: football_hub
+
+# To use a different export config:
+# python export_hub.py export=ball_only
+# python export_hub.py export=detection_full

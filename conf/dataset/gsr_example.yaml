@@ -1,0 +1,7 @@
+# Example GSR dataset configuration
+
+type: gsr
+tag: my_gsr_dataset
+path: /path/to/gsr/data
+splits: [train, valid, test]
+
