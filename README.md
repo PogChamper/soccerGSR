@@ -26,13 +26,13 @@ https://disk.360.yandex.ru/d/CJDIWx1TFLYpxA
 
 Планируется также задействовать датасет [**SportsMOT**](https://www.kaggle.com/datasets/ayushspai/sportsmot).
 
-А также [**SoccerTrack**](https://sites.google.com/g.sp.m.is.nagoya-u.ac.jp/stc2025).
-Гугл-диск датасета с главной страницы [тут](https://drive.google.com/drive/folders/1_o78gcL4j0xHxbRjSR1Evs4VLXCr2ncD).
-Ссылка на диск с другими форматами появится позже.
-
 **Скачать датасет:**
 https://disk.360.yandex.ru/d/5Ta8nKRVVrr5Ug
 (здесь уже оставлены только футбольные клипы, а также вдобавок к MOT формату добавлен COCO формат)
+
+А также [**SoccerTrack**](https://sites.google.com/g.sp.m.is.nagoya-u.ac.jp/stc2025).
+Гугл-диск датасета с главной страницы [тут](https://drive.google.com/drive/folders/1_o78gcL4j0xHxbRjSR1Evs4VLXCr2ncD).
+Ссылка на диск с другими форматами появится позже.
 
 ### Множественные форматы для работы с датасетом SoccerNet
 ```
