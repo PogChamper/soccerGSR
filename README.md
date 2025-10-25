@@ -1,3 +1,19 @@
+**SoccerNet (GSR):**
+
+https://disk.360.yandex.ru/d/CJDIWx1TFLYpxA
+Содержимое положить в директорию data внутри основной директории
+
+
+**SportsMOT**
+
+https://disk.360.yandex.ru/d/5Ta8nKRVVrr5Ug
+(здесь уже оставлены только футбольные клипы, а также вдобавок к MOT формату добавлен COCO формат)
+
+**socceryolo (маленький, но хорошо размеченный даатсет с roboflow)**
+
+https://disk.360.yandex.ru/d/3h6sT_o1ZYhT1A
+
+
 ## Установка
 
 ### Создать окружение и установить зависимости
