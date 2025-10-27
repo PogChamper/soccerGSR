@@ -1,0 +1,60 @@
+# Hydra Configuration for Data Ingestion
+
+defaults:
+  - _self_
+
+# Hub configuration
+hub:
+  name: football_hub
+  persistent: true
+
+# Datasets to ingest
+# Each dataset has: type, path, tag, status, splits, and type-specific config
+datasets:
+  
+  # gsr_main:
+  #   enabled: true
+  #   type: gsr  # GSR format (SoccerNet)
+  #   tag: gsr
+  #   path: /home/dxdxxd/projects/soccerGSR/data
+  #   splits: [train, valid, test]
+  #   status: gold # status "gold" means dataset has 4 classes (ball, goalkeeper, player, referee) been labeled 
+  
+  sportsmot_refined:
+    enabled: true
+    type: yolo
+    tag: sportsmot
+    path: /home/dxdxxd/projects/dataIntegratorSoccer/exports/sportsmot_cvat_verified/yolo
+    splits: [train, val]
+    status: gold # status "raw" means dataset has less than 4 classes been labeled
+    class_mapping:
+      "0": player
+      "1": goalkeeper
+      "2": referee
+      "3": ball
+
+  yolo_small:
+    enabled: true
+    type: yolo  # YOLO format
+    tag: socceryolo
+    path: /mnt/d/datasets/socceryolo
+    splits: [train, val, test]
+    status: gold
+    class_mapping:
+      "0": ball
+      "1": goalkeeper
+      "2": player
+      "3": referee
+
+  # supertest:
+  #   enabled: true
+  #   type: yolo
+  #   tag: supertest
+  #   path: /home/dxdxxd/projects/test_football_data_search/super_test_1
+  #   splits: [test]
+  #   status: gold
+  #   class_mapping:
+  #     "0": ball
+  #     "1": goalkeeper
+  #     "2": player
+  #     "3": referee

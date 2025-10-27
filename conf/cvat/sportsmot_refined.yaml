@@ -1,0 +1,63 @@
+# CVAT Configuration: SportsMOT Refined Annotations
+# Send heuristically refined annotations to CVAT for manual verification
+
+name: sportsmot_refined_annotations
+
+anno_key: sportsmot_refined_v1
+
+# Use refined detections field
+label_field: refined_detections
+
+# Label type (for new fields only)
+label_type: detections
+
+cvat_url: http://localhost:8080
+
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+attributes: {}
+
+# More permissive for fixing heuristic mistakes
+allow_additions: true
+allow_deletions: true
+allow_label_edits: true
+allow_spatial_edits: true
+
+filter:
+  dataset_tags:
+    - sportsmot
+  
+  splits:
+    - train
+    - valid
+    - test
+  
+  status: null
+
+# Subsampling
+subsample_configs:
+  sportsmot:
+    enabled: true
+    frame_interval: 25  # 1 FPS
+
+# Limit for testing
+limit: null
+
+task_size: 50
+segment_size: 25
+project_name: sportsmot_refined_verification
+
+launch_editor: true
+load_annotations: false
+dest_field: null
+
+# Add tag after verification in CVAT
+add_tag_on_import: cvat_verified_v1
+
+cleanup: false
+delete_run: false
+

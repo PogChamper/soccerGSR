@@ -32,9 +32,11 @@ class UnifiedExporter:
         """Execute export pipeline based on configuration."""
         export_name = export_cfg.name
         output_dir = Path(export_cfg.output_dir)
+        label_field = export_cfg.get('label_field', 'detections')
         
         print(f"\n{'=' * 80}")
         print(f"Export: {export_name}")
+        print(f"Label field: {label_field}")
         print(f"{'=' * 80}")
         
         print(f"\n[1/5] Building filtered view...")
@@ -46,7 +48,7 @@ class UnifiedExporter:
         print(f"After subsampling: {len(view)}")
         
         print(f"\n[3/5] Filtering classes...")
-        view = self._filter_classes(view, export_cfg.classes)
+        view = self._filter_classes(view, export_cfg.classes, label_field)
         print(f"After class filtering: {len(view)}")
         
         print(f"\n[4/5] Splitting data...")
@@ -55,7 +57,7 @@ class UnifiedExporter:
             print(f"{split_name}: {len(split_view)} samples")
         
         print(f"\n[5/5] Exporting to formats...")
-        self._export_formats(export_name, splits, export_cfg, output_dir)
+        self._export_formats(export_name, splits, export_cfg, output_dir, label_field)
         
         print(f"\n{'=' * 80}")
         print(f"Export Complete!")
@@ -85,6 +87,13 @@ class UnifiedExporter:
         if hasattr(export_cfg, 'status') and export_cfg.status:
             view = view.match(F("status") == export_cfg.status)
             print(f"Filtered by status: {export_cfg.status}")
+        
+        # Filter by sample tags
+        if hasattr(export_cfg, 'sample_tags') and export_cfg.sample_tags:
+            sample_tags = list(export_cfg.sample_tags)
+            for tag in sample_tags:
+                view = view.match_tags(tag)
+            print(f"Filtered by sample tags: {sample_tags}")
         
         return view
     
@@ -133,7 +142,7 @@ class UnifiedExporter:
         return self.hub.select(all_sample_ids)
     
     def _filter_classes(self, view: fo.DatasetView,
-                        classes: List[str]) -> fo.DatasetView:
+                        classes: List[str], label_field: str = "detections") -> fo.DatasetView:
         """Filter detections to specified classes and remove empty samples."""
         if not classes or classes == ['all']:
             print(f"Keeping all classes")
@@ -141,11 +150,14 @@ class UnifiedExporter:
         
         print(f"Keeping classes: {classes}")
         
+        # Extract the actual field name (remove 'frames.' prefix if present)
+        field_name = label_field.split('.')[-1]
+        
         filtered_view = view.filter_labels(
-            "detections", F("label").is_in(classes)
+            label_field, F("label").is_in(classes)
         )
         filtered_view = filtered_view.match(
-            F("detections.detections").length() > 0
+            F(f"{field_name}.detections").length() > 0
         )
         
         print(f"Samples with selected classes: {len(filtered_view)}")
@@ -167,7 +179,7 @@ class UnifiedExporter:
         return splits
     
     def _export_formats(self, export_name: str, splits: dict,
-                        export_cfg: DictConfig, output_dir: Path):
+                        export_cfg: DictConfig, output_dir: Path, label_field: str = "detections"):
         """Export to configured formats (YOLO/COCO)."""
         formats = export_cfg.formats
         classes = list(export_cfg.classes)
@@ -176,14 +188,14 @@ class UnifiedExporter:
             print(f"\nExporting to {format_name.upper()} format...")
             
             if format_name == "yolo":
-                self._export_yolo(export_name, splits, classes, output_dir)
+                self._export_yolo(export_name, splits, classes, output_dir, label_field)
             elif format_name == "coco":
-                self._export_coco(export_name, splits, classes, output_dir)
+                self._export_coco(export_name, splits, classes, output_dir, label_field)
             else:
                 print(f"  Unknown format: {format_name}")
     
     def _export_yolo(self, export_name: str, splits: dict,
-                     classes: List[str], output_dir: Path):
+                     classes: List[str], output_dir: Path, label_field: str = "detections"):
         """Export to YOLO format with class remapping."""
         export_dir = output_dir / export_name / "yolo"
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -203,7 +215,7 @@ class UnifiedExporter:
                 export_dir=str(split_dir),
                 dataset_type=fo.types.YOLOv5Dataset,
                 classes=classes,
-                label_field="detections"
+                label_field=label_field
             )
             
             self._flatten_yolo_structure(split_dir)
@@ -258,7 +270,7 @@ class UnifiedExporter:
             yaml.dump(data_yaml, f, default_flow_style=False, sort_keys=False)
     
     def _export_coco(self, export_name: str, splits: dict,
-                     classes: List[str], output_dir: Path):
+                     classes: List[str], output_dir: Path, label_field: str = "detections"):
         """Export to COCO format with class remapping (1-indexed)."""
         export_dir = output_dir / export_name / "coco"
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +295,7 @@ class UnifiedExporter:
                 export_dir=str(temp_dir),
                 dataset_type=fo.types.COCODetectionDataset,
                 classes=classes,
-                label_field="detections"
+                label_field=label_field
             )
             
             self._restructure_coco(temp_dir, images_dir, annotations_dir, split_name)

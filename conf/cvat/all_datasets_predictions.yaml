@@ -1,0 +1,59 @@
+# CVAT Configuration: All Datasets Predictions
+# Send predictions from all datasets to CVAT
+
+name: all_datasets_predictions
+
+anno_key: all_predictions_v1
+
+label_field: yolo_predictions
+label_type: detections
+
+cvat_url: http://localhost:8080
+
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+attributes: {}
+
+allow_additions: true
+allow_deletions: true
+allow_label_edits: true
+allow_spatial_edits: true
+
+# Include all datasets
+filter:
+  dataset_tags:
+    - gsr
+    - sportsmot
+    - socceryolo
+  
+  splits: []  # All splits
+  status: null  # Any status
+
+# Different subsampling per dataset
+subsample_configs:
+  gsr:
+    enabled: true
+    frame_interval: 25
+  sportsmot:
+    enabled: true
+    frame_interval: 25
+  socceryolo:
+    enabled: false  # Images, no subsampling
+
+limit: 100  # Send only 100 samples for testing
+
+task_size: 20
+segment_size: 10
+project_name: all_predictions_refinement
+
+launch_editor: true
+load_annotations: false
+dest_field: null
+add_tag_on_import: predictions_refined
+cleanup: false
+delete_run: false
+

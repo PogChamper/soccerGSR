@@ -1,0 +1,6 @@
+defaults:
+  - refine: sportsmot_heuristic
+
+hub:
+  name: football_hub
+

@@ -1,0 +1,6 @@
+defaults:
+  - evaluate: coco_protocol
+
+hub:
+  name: football_hub
+

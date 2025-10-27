@@ -1,0 +1,38 @@
+name: coco_evaluation
+
+pred_field: yolo_predictions
+gt_field: detections
+eval_key: eval_coco
+
+method: coco
+iou: 0.5
+classwise: true
+iscrowd_attr: iscrowd
+
+filter:
+  dataset_tags:
+    - socceryolo
+  splits:
+    - test    # or valid, test
+  status: gold
+  pred_field_exists: true
+
+compute_mAP: true
+print_metrics: true
+print_report: true
+
+report_classes: null
+
+plot_pr_curves: true
+pr_curve_classes: null
+
+plot_confusion_matrix: true
+confusion_matrix_classes: null
+
+save_views: true
+top_n: 50
+
+output_dir: outputs/evaluations
+
+max_samples: null
+

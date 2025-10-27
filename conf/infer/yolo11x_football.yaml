@@ -1,0 +1,27 @@
+name: yolo11x_football_inference
+
+model:
+  type: ultralytics
+  path: /mnt/c/users/user/xanylabeling_data/trainer/ultralytics/runs/detect/footbal_test_train2/weights/best.pt
+  conf_threshold: 0.25
+  nms_threshold: 0.45
+  img_size: 1280
+  class_map:
+    0: player
+    1: goalkeeper
+    2: referee
+    3: ball
+
+pred_field: yolo_predictions
+
+filter:
+  dataset_tags:
+    - socceryolo
+  splits:
+    # - train
+    # - valid
+    - test
+  status: gold
+
+max_samples: null
+

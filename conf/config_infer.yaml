@@ -1,0 +1,6 @@
+defaults:
+  - infer: yolo11x_football
+
+hub:
+  name: football_hub
+

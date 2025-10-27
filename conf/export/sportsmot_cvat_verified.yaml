@@ -1,0 +1,37 @@
+# Export Configuration: SportsMOT CVAT Verified
+# Export only samples that were verified in CVAT (with cvat_verified_v1 tag)
+
+name: sportsmot_cvat_verified
+
+# Export refined detections field (after heuristic + CVAT verification)
+label_field: refined_detections
+
+dataset_tags:
+  - sportsmot
+
+# Filter by sample tags - only export CVAT verified samples
+sample_tags:
+  - cvat_verified_v1
+
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+splits:
+  - train
+  - valid
+  - test
+
+subsample_configs:
+  sportsmot:
+    enabled: true
+    frame_interval: 25  # 1 FPS
+
+formats:
+  - yolo
+  - coco
+
+output_dir: exports
+

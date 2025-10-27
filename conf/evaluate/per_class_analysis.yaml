@@ -1,0 +1,48 @@
+name: per_class_analysis
+
+pred_field: yolo_predictions
+gt_field: detections
+eval_key: eval_per_class
+
+method: coco
+iou: 0.5
+classwise: true
+
+filter:
+  dataset_tags:
+    - socceryolo
+  splits:
+    - test
+  status: gold
+  pred_field_exists: true
+
+compute_mAP: true
+print_metrics: true
+print_report: true
+
+report_classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+plot_pr_curves: true
+pr_curve_classes:
+  - player
+  - goalkeeper
+  - ball
+
+plot_confusion_matrix: true
+confusion_matrix_classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+save_views: true
+top_n: 100
+
+output_dir: outputs/evaluations
+
+max_samples: null
+

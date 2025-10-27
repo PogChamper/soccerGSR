@@ -1,3 +1,28 @@
+**SoccerNet (GSR):**
+
+https://disk.360.yandex.ru/d/CJDIWx1TFLYpxA
+Содержимое положить в директорию data внутри основной директории
+
+
+**SportsMOT**
+
+https://disk.360.yandex.ru/d/5Ta8nKRVVrr5Ug
+(здесь уже оставлены только футбольные клипы, а также вдобавок к MOT формату добавлен COCO формат)
+
+**socceryolo (маленький, но хорошо размеченный даатсет с roboflow)** - размечены все 4 класса, готов для использования в обучении
+
+https://disk.360.yandex.ru/d/3h6sT_o1ZYhT1A
+
+**SportsMOT в gold формате, размечены все 4 класса, готов для использования в обучении**
+
+https://disk.360.yandex.ru/d/egZgpzlGALA9KA
+
+
+**Инструкции по новому функционалу тут: PIPELINE_FULL.md**
+
+**Веса модели yolo11x (1280), которые использовал для исправления разметки sportsmot: https://disk.360.yandex.ru/d/OJHvU7A19dqbTg**
+
+
 ## Установка
 
 ### Создать окружение и установить зависимости
@@ -60,14 +85,63 @@ python export_hub.py export=detection_full export.dataset_tags=[sportsmot]
 
 -----
 
-## 3\. Просмотр в FiftyOne
+## 3\. Инференс модели
+
+`infer_model.py` - запуск ONNX/Ultralytics модели на данных из хаба.
 
 ```bash
-python view_hub.py
+# Инференс на всех данных sportsmot
+python infer_model.py infer=sportsmot_inference
+
+# На конкретном split
+python infer_model.py infer=sportsmot_inference \
+  infer.filter.splits=[test]
+
+# Ограничить количество samples
+python infer_model.py infer=sportsmot_inference +max_samples=100
 ```
 
-Полностью удалить хаб из FiftyOne:
+**Что происходит:**
+- Модель обрабатывает samples с `dataset_tag=sportsmot`
+- Создается поле `yolo_predictions` с результатами
+- Классы: player, goalkeeper, referee, ball
+
+**Конфиг:** `conf/infer/sportsmot_inference.yaml`
+
+-----
+
+## 4\. Оценка модели (метрики)
+
+`evaluate_model.py` - подсчет метрик качества модели.
 
 ```bash
+# COCO метрики на всем sportsmot (все splits)
+python evaluate_model.py evaluate=coco_protocol \
+  +evaluate.filter.dataset_tags=[sportsmot] \
+  +evaluate.filter.splits=[]
+
+# Только на test split
+python evaluate_model.py evaluate=coco_protocol \
+  +evaluate.filter.dataset_tags=[sportsmot] \
+  +evaluate.filter.splits=[test]
+```
+
+**Что получите:**
+- mAP
+- Precision, Recall, F1 по каждому классу
+- Confusion matrix (PNG в `outputs/evaluations/`)
+- PR кривые (PNG в `outputs/evaluations/`)
+
+-----
+
+## 5\. Просмотр в FiftyOne
+
+```bash
+# Открыть FiftyOne App
+python view_hub.py
+
+# Полностью удалить хаб
 python view_hub.py --delete
 ```
+
+-----

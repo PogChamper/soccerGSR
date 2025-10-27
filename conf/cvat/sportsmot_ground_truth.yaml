@@ -1,0 +1,58 @@
+# CVAT Configuration: SportsMOT Ground Truth Editing
+# Edit existing ground truth annotations for sportsmot dataset
+
+name: sportsmot_ground_truth_edit
+
+anno_key: sportsmot_gt_edit_v1
+
+# Edit existing ground truth field
+label_field: detections
+
+# CVAT server URL
+cvat_url: http://localhost:8080
+
+# Classes (inferred from existing labels if not specified)
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+attributes: {}
+
+# More restrictive edit permissions for ground truth
+allow_additions: false
+allow_deletions: false
+allow_label_edits: false
+allow_spatial_edits: true  # Only allow bbox adjustments
+
+# Filter configuration
+filter:
+  dataset_tags:
+    - sportsmot
+  
+  splits:
+    - test  # Only edit test split
+  
+  status: gold  # Only gold status samples
+
+# Subsampling
+subsample_configs:
+  sportsmot:
+    enabled: true
+    frame_interval: 50  # Less dense sampling for review
+
+# Limit to first 20 samples for testing
+limit: 20
+
+task_size: 10
+segment_size: 5
+project_name: sportsmot_gt_corrections
+
+launch_editor: true
+load_annotations: false
+dest_field: null
+add_tag_on_import: gt_corrected
+cleanup: false
+delete_run: false
+

@@ -1,0 +1,33 @@
+# Export Configuration: SportsMOT Predictions
+# Export predictions from sportsmot dataset
+
+name: sportsmot_predictions
+
+# Export predictions field instead of detections
+label_field: yolo_predictions
+
+dataset_tags:
+  - sportsmot
+
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+splits:
+  - train
+  - valid
+  - test
+
+subsample_configs:
+  sportsmot:
+    enabled: true
+    frame_interval: 25  # 1 FPS
+
+formats:
+  - yolo
+  - coco
+
+output_dir: exports
+

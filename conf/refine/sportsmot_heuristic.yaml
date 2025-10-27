@@ -1,0 +1,45 @@
+# Refinement Configuration: SportsMOT Heuristic
+# Apply heuristic rules to refine SportsMOT annotations using model predictions
+
+name: sportsmot_heuristic_refinement
+
+# Input fields
+gt_field: detections           # Ground truth field (pedestrian class)
+pred_field: yolo_predictions   # Predictions field (player, goalkeeper, referee, ball)
+
+# Output field for refined annotations
+output_field: refined_detections
+
+# IoU threshold for matching GT and predictions
+iou_threshold: 0.8
+
+# Maximum counts for specific classes
+max_goalkeepers: 2  # Maximum 2 goalkeepers per sample/frame
+max_referees: 2     # Maximum 2 referees per sample/frame
+
+# Filter configuration
+filter:
+  dataset_tags:
+    - sportsmot
+  
+  splits:
+    - train
+    - valid
+    - test
+  
+  status: null  # Any status
+
+# Limit number of samples to process (null = all)
+limit: null
+
+# Refinement rules applied:
+# 1. Match GT pedestrian with predictions by IoU > threshold:
+#    - pedestrian + player prediction (IoU > 0.8) → player
+#    - pedestrian + goalkeeper prediction (IoU > 0.8) → goalkeeper (max 2)
+#    - pedestrian + referee prediction (IoU > 0.8) → referee
+#
+# 2. Add top-1 ball detection with highest confidence
+#
+# 3. Add top-2 referee detections with highest confidence
+#    (only if they don't overlap with GT pedestrians)
+

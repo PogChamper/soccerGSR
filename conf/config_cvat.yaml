@@ -1,0 +1,6 @@
+defaults:
+  - cvat: sportsmot_predictions
+
+hub:
+  name: football_hub
+

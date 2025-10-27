@@ -1,0 +1,99 @@
+# CVAT Configuration: SportsMOT Predictions Annotation
+# Send inference results from sportsmot dataset to CVAT for refinement
+
+name: sportsmot_predictions_annotation
+
+# Unique identifier for this annotation run
+anno_key: sportsmot_yolo_predictions_v1
+
+# Label field to annotate (can be predictions or any other detection field)
+label_field: yolo_predictions
+
+# Label type (for new fields only)
+label_type: detections
+
+# CVAT server URL (use environment variable or set here)
+cvat_url: http://localhost:8080
+
+# Classes to annotate
+classes:
+  - player
+  - goalkeeper
+  - referee
+  - ball
+
+# Label attributes (optional)
+attributes: {}
+
+# Edit permissions
+allow_additions: true
+allow_deletions: true
+allow_label_edits: true
+allow_spatial_edits: true
+
+# Filter configuration
+filter:
+  # Dataset tags to include
+  dataset_tags:
+    - sportsmot
+  
+  # Splits to include (empty list = all splits)
+  splits:
+    - train
+    - valid
+    - test
+  
+  # Status filter (null = any status)
+  status: null
+  
+  # Sample tags filter (optional)
+  # sample_tags:
+  #   - needs_review
+  
+  # Classes filter (optional, filter samples that have these classes)
+  # classes:
+  #   - ball
+
+# Frame subsampling (similar to export_hub)
+subsample_configs:
+  sportsmot:
+    enabled: true
+    frame_interval: 25  # Upload every 25th frame (1 FPS for 25fps video)
+
+# Limit number of samples to send (null = no limit)
+limit: null
+
+# CVAT task organization
+task_size: 50  # Maximum images per task (for image datasets)
+segment_size: 25  # Maximum images per job
+project_name: sportsmot_predictions_refinement
+
+# User assignment (optional)
+# task_assignee: username
+# job_assignees:
+#   - user1
+#   - user2
+
+# Video-specific parameters (if working with videos)
+# frame_start: 0
+# frame_stop: null
+# frame_step: null
+
+# Launch CVAT editor after upload
+launch_editor: true
+
+# Import settings (used when +cvat.load_annotations=true)
+load_annotations: false
+
+# Field to load annotations into (null = use original field)
+dest_field: null
+
+# Tag to add to samples after successful import
+add_tag_on_import: cvat_refined_v1
+
+# Cleanup CVAT tasks after import
+cleanup: false
+
+# Delete annotation run record after import
+delete_run: false
+
