@@ -1,7 +1,7 @@
 # Eval моделей YOLO
 
 ```bash
-pip install -r requirements_eval.txt
+pip install -r requirements.txt
 ```
 
 ```bash
