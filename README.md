@@ -238,6 +238,6 @@ soccer-app/
 * **OlegNotHehe** (Олег Рокин) - Researcher
 * **FoshchanVArvar** (Виктор Фощан) - Researcher (не участвовал в чекпоинтах, начиная с обучения бейзлайн моделей)
 
-## 👨Куратор
+## Куратор
 
 * **Mark Blumenau** (Марк Блуменау)
