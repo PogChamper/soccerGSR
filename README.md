@@ -97,15 +97,21 @@ MODEL_PATH=/path/to/your/model.onnx
 
 ### POST /forward
 
-Отправка видео на обработку:
+Отправка видео на обработку (сохранение в файл):
 
 ```bash
 curl -X POST "http://localhost:8000/forward" \
-  -H "Content-Type: multipart/form-data" \
-  -F "image=@video.mp4"
+  -F "image=@video.mp4" \
+  -H "X-Return-Format: stream" \
+  -o output.mp4
 ```
 
-Ответ в формате base64 (по умолчанию):
+Для получения JSON с base64-encoded видео:
+```bash
+curl -X POST "http://localhost:8000/forward" -F "image=@video.mp4"
+```
+
+Ответ в формате JSON:
 ```json
 {
   "status": "success",
@@ -119,14 +125,6 @@ curl -X POST "http://localhost:8000/forward" \
     "total_detections": 1500
   }
 }
-```
-
-Для получения видео в виде потока:
-```bash
-curl -X POST "http://localhost:8000/forward" \
-  -H "X-Return-Format: stream" \
-  -F "image=@video.mp4" \
-  -o output.mp4
 ```
 
 ### GET /history
