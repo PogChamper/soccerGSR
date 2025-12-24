@@ -32,6 +32,7 @@ env/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
 # Environment
 .env
@@ -51,7 +52,7 @@ env/
 *.log
 logs/
 
-# Model files
+# Model files (only root /models/, not app/models/)
 /models/
 *.onnx
 *.pt
@@ -63,3 +64,16 @@ processed_*.mp4
 *.mp4
 *.avi
 *.mkv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
