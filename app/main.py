@@ -1,4 +1,5 @@
 import os
+import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,15 @@ from app.api import forward, history, stats, auth
 
 import uvicorn
 
+
+# Configure logging for app modules
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S"
+)
+# Set app loggers to INFO level
+logging.getLogger("app").setLevel(logging.INFO)
 
 settings = get_settings()
 

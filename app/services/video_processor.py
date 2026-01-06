@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import tempfile
 import os
+import logging
 from pathlib import Path
 from typing import Generator, Tuple, Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from app.services.detector import Detection, YOLODetector
 from app.utils.visualizer import draw_detections, draw_legend
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -178,6 +180,13 @@ class VideoProcessor:
         # Processing stats
         stats = ProcessingStats()
         start_time = time.time()
+        last_log_time = start_time
+        log_interval = 5.0  # Log every 5 seconds
+        
+        logger.info(
+            f"Starting video processing: {metadata.filename} "
+            f"({metadata.frame_count} frames, {metadata.duration:.1f}s, {metadata.width}x{metadata.height})"
+        )
         
         try:
             for frame_idx, frame in self.extract_frames(input_path):
@@ -199,6 +208,23 @@ class VideoProcessor:
                     elif det.class_id == 3:
                         stats.balls_count += 1
                 
+                # Progress logging (every log_interval seconds)
+                current_time = time.time()
+                if current_time - last_log_time >= log_interval:
+                    progress = (stats.frames_processed / metadata.frame_count) * 100
+                    elapsed = current_time - start_time
+                    fps_processing = stats.frames_processed / elapsed if elapsed > 0 else 0
+                    eta = (metadata.frame_count - stats.frames_processed) / fps_processing if fps_processing > 0 else 0
+                    
+                    logger.info(
+                        f"Progress: {progress:.1f}% | "
+                        f"Frame {stats.frames_processed}/{metadata.frame_count} | "
+                        f"Speed: {fps_processing:.1f} fps | "
+                        f"ETA: {eta:.0f}s | "
+                        f"Detections: {stats.total_detections}"
+                    )
+                    last_log_time = current_time
+                
                 # Draw detections
                 annotated = draw_detections(frame, detections)
                 
@@ -213,6 +239,15 @@ class VideoProcessor:
             writer.release()
             
         stats.processing_time = time.time() - start_time
+        
+        logger.info(
+            f"Processing complete: {metadata.filename} | "
+            f"Time: {stats.processing_time:.1f}s | "
+            f"Frames: {stats.frames_processed} | "
+            f"Detections: {stats.total_detections} "
+            f"(players: {stats.players_count}, goalkeepers: {stats.goalkeepers_count}, "
+            f"referees: {stats.referees_count}, balls: {stats.balls_count})"
+        )
         
         return output_path, metadata, stats
     

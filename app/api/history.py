@@ -4,9 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models.database import get_db
+from app.models.database import get_db, User
 from app.models.schemas import HistoryResponse, RequestHistoryItem, DeleteHistoryResponse
 from app.services import history_service
+from app.api.auth import get_current_admin_user
 
 settings = get_settings()
 router = APIRouter()
@@ -44,32 +45,26 @@ async def get_history(
 @router.delete("/history", response_model=DeleteHistoryResponse)
 async def delete_history(
     db: AsyncSession = Depends(get_db),
-    x_admin_token: str = Header(..., alias="X-Admin-Token")
+    current_user: User = Depends(get_current_admin_user)
 ):
     """Delete all request history.
     
-    Requires admin token in X-Admin-Token header.
+    Requires JWT authentication with admin privileges.
     
-    Headers:
-        X-Admin-Token: Admin verification token (required)
+    Authorization:
+        Token from admin user (required)
     
     Returns:
         DeleteHistoryResponse with count of deleted entries
     
     Raises:
-        401: Invalid or missing token
+        401: Unauthorized (missing or invalid token)
+        403: Forbidden (user is not admin)
     """
-    # Verify admin token
-    if x_admin_token != settings.admin_delete_token:
-        raise HTTPException(
-            status_code=401,
-            detail="unauthorized"
-        )
-    
     deleted_count = await history_service.delete_all_history(db)
     
     return DeleteHistoryResponse(
         deleted_count=deleted_count,
-        message=f"Successfully deleted {deleted_count} history entries"
+        message=f"Successfully deleted {deleted_count} history entries by {current_user.username}"
     )
 
