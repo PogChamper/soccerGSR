@@ -1,117 +1,146 @@
-import os
 import logging
-from pathlib import Path
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api import auth, forward, history, jobs, stats
 from app.config import get_settings
 from app.models.database import init_db
-from app.api import forward, history, stats, auth
+from app.services.job_worker import start_worker, stop_worker
+from app.utils.cuda_env import bootstrap as cuda_bootstrap
 
-import uvicorn
-
-
-# Configure logging for app modules
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
-# Set app loggers to INFO level
 logging.getLogger("app").setLevel(logging.INFO)
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def ensure_model():
-    """Ensure model exists, download if necessary."""
-    model_path = Path(settings.model_path)
-    
-    if model_path.exists():
-        print(f"Model found at: {model_path}")
-        return
-    
+def ensure_models() -> None:
+    """Best-effort: download / verify all registered models on startup."""
+    from app.utils.models_registry import REGISTRY, ensure_models as _em
+
     if not settings.model_auto_download:
-        print(f"WARNING: Model not found at {model_path}")
-        print("Set MODEL_AUTO_DOWNLOAD=true or download manually")
+        logger.info("model_auto_download=False, skipping registry ensure")
         return
-    
-    print(f"Model not found at {model_path}")
-    print("Downloading from Google Drive...")
-    
-    from app.utils.model_loader import download_model_from_gdrive
-    download_model_from_gdrive(
-        file_id=settings.model_gdrive_id,
-        output_path=model_path
-    )
+
+    results = _em(list(REGISTRY), skip_missing_remotes=True)
+    for name, path in results.items():
+        if path and Path(path).exists():
+            logger.info(f"model OK : {name:20s} -> {path}")
+        else:
+            logger.warning(
+                f"model MISS: {name:20s} (services depending on it will fail loudly later)"
+            )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    # Startup
-    print(f"Starting {settings.app_name}...")
-    
-    # Ensure temp directory exists
+    logger.info(f"Starting {settings.app_name}...")
+    if "change-in-production" in settings.secret_key:
+        logger.warning(
+            "SECRET_KEY is the default placeholder — set a real one in .env "
+            "before exposing this service"
+        )
     os.makedirs(settings.temp_dir, exist_ok=True)
-    
-    # Ensure model exists (download if needed)
-    ensure_model()
-    
-    # Initialize database
+
+    cuda_ok = cuda_bootstrap()
+    logger.info(f"CUDA bootstrap: {'OK (GPU)' if cuda_ok else 'CPU fallback'}")
+
+    ensure_models()
+
     await init_db()
-    print("Database initialized")
-    
-    # Pre-load detector
+    logger.info("Database initialized")
+
+    # IMPORTANT: load ALL onnxruntime-gpu sessions BEFORE anything that imports
+    # torch (boxmot/PnLCalib). torch's cudnn frontend init conflicts with ORT
+    # cudnn frontend on CUDA13 + cudnn 9.1, causing CUDNN_BACKEND_API_FAILED on
+    # session creation if torch wins the race. Load order matters here.
     try:
         from app.services.detector import get_detector
-        detector = get_detector()
-        print(f"Model loaded from: {settings.model_path}")
-    except Exception as e:
-        print(f"Warning: Could not pre-load model: {e}")
-    
+
+        get_detector()
+        logger.info(f"Detector loaded (backend={settings.detector_backend})")
+    except Exception as exc:
+        logger.exception(f"Could not pre-load detector: {exc}")
+
+    try:
+        from app.services.jersey import get_jersey_recognizer
+
+        get_jersey_recognizer()
+        logger.info("Jersey recognizer loaded (visibility gate + OCR)")
+    except Exception as exc:
+        logger.warning(f"Could not pre-load jersey recognizer: {exc}")
+
+    try:
+        from app.services.embedder import get_embedder
+
+        get_embedder()
+        logger.info("DINOv3 embedder loaded (ReID + team clustering)")
+    except Exception as exc:
+        logger.warning(f"Could not pre-load DINOv3 embedder: {exc}")
+
+    try:
+        from app.services.keypoints import get_keypoints_extractor
+
+        get_keypoints_extractor()
+        logger.info("HRNet keypoints + lines extractor loaded")
+    except Exception as exc:
+        logger.warning(f"Could not pre-load keypoints extractor: {exc}")
+
+    await start_worker()
+    logger.info("GSR job worker started")
+
     yield
-    
-    # Shutdown
-    print("Shutting down...")
+
+    logger.info("Stopping job worker...")
+    await stop_worker()
+    logger.info("Shutdown complete")
 
 
-# Create FastAPI app
 app = FastAPI(
     title=settings.app_name,
     description="""
-## SoccerGSR ML Service
+## SoccerGSR ML Service (async)
 
-ML-сервис для анализа футбольных трансляций.
+Two-pass GSR pipeline (detection [+tracking +jersey +team +calibration]) for
+soccer broadcast clips. All inference is GPU-bound; one job at a time.
 
-### Возможности:
-- **POST /forward** - Инференс видео через YOLO детектор
-- **GET /history** - История запросов
-- **DELETE /history** - Удаление истории (требует токен)
-- **GET /stats** - Статистика запросов
+### Inference
+- **POST /forward** — submit a video, returns `202 Accepted` + `job_id`.
+- **GET /jobs/{id}** — poll status / progress.
+- **GET /jobs/{id}/video** — download annotated mp4 (when `done`).
+- **GET /jobs/{id}/gsr.json** — structured per-frame GSR state.
+- **POST /forward/sync** — legacy sync wrapper (polls until done).
 
-### Авторизация:
-- **POST /auth/register** - Регистрация пользователя
-- **POST /auth/login** - Получение JWT токена
-- **GET /auth/me** - Информация о текущем пользователе
-    """,
-    version="1.0.0",
-    lifespan=lifespan
+### Other
+- **GET /history**, **DELETE /history**, **GET /stats**
+- **POST /auth/...** — JWT registration / login
+""",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Auth uses bearer tokens (no cookies), so credentials are not needed —
+# wildcard origins + allow_credentials=True is an unsafe combination.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(forward.router, tags=["inference"])
+app.include_router(jobs.router, tags=["gsr"])
+app.include_router(forward.router, tags=["gsr-legacy"])
 app.include_router(history.router, tags=["history"])
 app.include_router(stats.router, tags=["statistics"])
 app.include_router(auth.router)
@@ -119,39 +148,52 @@ app.include_router(auth.router)
 
 @app.get("/", tags=["root"])
 async def root():
-    """Root endpoint - service info."""
     return {
         "service": settings.app_name,
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "endpoints": {
-            "forward": "POST /forward - Run video inference",
-            "history": "GET /history - Get request history",
-            "delete_history": "DELETE /history - Delete history (requires X-Admin-Token)",
-            "stats": "GET /stats - Get statistics",
+            "forward": "POST /forward (202 + job_id)",
+            "job_status": "GET /jobs/{id}",
+            "job_video": "GET /jobs/{id}/video",
+            "job_gsr_json": "GET /jobs/{id}/gsr.json",
+            "list_jobs": "GET /jobs",
+            "forward_sync": "POST /forward/sync (legacy)",
+            "history": "GET /history",
+            "delete_history": "DELETE /history (admin JWT)",
+            "stats": "GET /stats",
             "auth": {
-                "register": "POST /auth/register - Register user",
-                "login": "POST /auth/login - Get JWT token",
-                "me": "GET /auth/me - Current user info"
-            }
-        }
+                "register": "POST /auth/register",
+                "login": "POST /auth/login",
+                "me": "GET /auth/me",
+            },
+        },
     }
 
 
 @app.get("/health", tags=["root"])
 async def health_check():
-    """Health check endpoint."""
     model_status = "unknown"
     try:
         from app.services.detector import get_detector
-        detector = get_detector()
+
+        get_detector()
         model_status = "loaded"
-    except Exception as e:
-        model_status = f"error: {str(e)}"
-    
+    except Exception as exc:
+        model_status = f"error: {exc}"
+
+    cuda_ok = False
+    try:
+        import onnxruntime as ort
+
+        cuda_ok = "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        pass
+
     return {
         "status": "healthy",
-        "model": model_status
+        "model": model_status,
+        "cuda": cuda_ok,
     }
 
 
@@ -160,6 +202,5 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=settings.debug
+        reload=settings.debug,
     )
-

@@ -58,12 +58,29 @@ logs/
 *.pt
 *.pth
 
-# Output videos
+# Output videos / clips / renders
 output_*.mp4
 processed_*.mp4
 *.mp4
 *.avi
 *.mkv
+*.webm
+*.mov
+*.gif
+*_gsr.json
+*.pkl
+
+# Local-only docs
+docs/
+
+# One-off dev scripts (presentation builders, diagnostics) — kept locally
+scripts/build_presentation.py
+scripts/add_method_slides.py
+scripts/add_video_gsr_slides.py
+scripts/refine_method_slides.py
+scripts/diag_aggregate.py
+scripts/diag_minimap.py
+scripts/iter_aggregate.py
 
 # Testing
 .pytest_cache/

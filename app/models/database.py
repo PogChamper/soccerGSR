@@ -64,6 +64,32 @@ class RequestHistory(Base):
     user = relationship("User", back_populates="requests")
 
 
+class Job(Base):
+    """Async GSR job. Owns its own input/output files on disk."""
+
+    __tablename__ = "jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(String(36), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+    status = Column(String(20), nullable=False, default="queued", index=True)
+    # queued | running | done | error | cancelled
+    stage = Column(String(20), nullable=True)
+    # pass1 | aggregate | pass2 | done
+    progress = Column(Float, nullable=True)         # 0.0 .. 100.0 within stage
+
+    input_filename = Column(String(255), nullable=True)
+    input_path = Column(Text, nullable=True)
+    output_video_path = Column(Text, nullable=True)
+    # GSR JSON is stored on disk (job_worker.gsr_json_path), not in the DB
+
+    error_message = Column(Text, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
 # Async engine and session
 engine = create_async_engine(settings.database_url, echo=settings.debug)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

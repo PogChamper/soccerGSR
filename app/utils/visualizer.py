@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 from app.services.detector import Detection
 from app.config import get_settings
@@ -8,40 +8,54 @@ from app.config import get_settings
 settings = get_settings()
 
 
+# Stable colors for the two teams (BGR). Referee/ball still use class colors.
+TEAM_COLORS = {
+    0: (255, 80, 0),     # team A: cyan-ish blue
+    1: (0, 80, 255),     # team B: warm orange
+}
+
+
+def _color_for(det: Detection, extra: Optional[dict]) -> tuple:
+    """Pick bbox color based on team for players, class color otherwise."""
+    if extra and det.class_id == 0 and extra.get("team_id") in TEAM_COLORS:
+        return TEAM_COLORS[extra["team_id"]]
+    if extra and det.class_id == 1 and extra.get("team_id") in TEAM_COLORS:
+        # Goalkeeper of team N — same hue, brighter
+        c = TEAM_COLORS[extra["team_id"]]
+        return tuple(min(255, int(v * 1.2) + 40) for v in c)
+    return settings.class_colors.get(det.class_id, (255, 255, 255))
+
+
 def draw_detections(
     frame: np.ndarray,
     detections: List[Detection],
     draw_labels: bool = True,
     draw_confidence: bool = True,
-    line_thickness: int = 2
+    line_thickness: int = 2,
+    extras: Optional[List[dict]] = None,
 ) -> np.ndarray:
-    """Draw detection bounding boxes on a frame.
-    
-    Args:
-        frame: Input frame in BGR format
-        detections: List of Detection objects
-        draw_labels: Whether to draw class labels
-        draw_confidence: Whether to draw confidence scores
-        line_thickness: Thickness of bbox lines
-        
-    Returns:
-        Frame with drawn detections
-    """
+    """Draw bboxes + labels (track id, jersey, class, confidence) on a copy
+    of the frame. ``extras[i]`` may carry track_id/jersey_number/team_id."""
     annotated = frame.copy()
-    
-    for det in detections:
-        # Get color for this class
-        color = settings.class_colors.get(det.class_id, (255, 255, 255))
-        
-        # Extract bbox coordinates
+
+    if extras is not None and len(extras) != len(detections):
+        # length mismatch is fatal — caller bug; drop extras silently rather than raise
+        extras = None
+
+    for i, det in enumerate(detections):
+        extra = extras[i] if extras else None
+        color = _color_for(det, extra)
+
         x1, y1, x2, y2 = [int(c) for c in det.bbox]
-        
-        # Draw bounding box
+
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, line_thickness)
-        
-        if draw_labels or draw_confidence:
-            # Prepare label text
+
+        if draw_labels or draw_confidence or extra:
             label_parts = []
+            if extra and extra.get("track_id") is not None:
+                label_parts.append(f"#{extra['track_id']}")
+            if extra and extra.get("jersey_number") is not None:
+                label_parts.append(f"J{extra['jersey_number']}")
             if draw_labels:
                 label_parts.append(det.class_name)
             if draw_confidence:
@@ -89,24 +103,13 @@ def draw_legend(
     padding: int = 10,
     item_height: int = 25
 ) -> np.ndarray:
-    """Draw class legend on frame.
-    
-    Args:
-        frame: Input frame
-        position: Legend position ('top-left', 'top-right', 'bottom-left', 'bottom-right')
-        padding: Padding from edges
-        item_height: Height of each legend item
-        
-    Returns:
-        Frame with legend
-    """
+    """Draw the class-colour legend in the requested corner."""
     annotated = frame.copy()
-    
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     font_thickness = 1
-    
-    # Calculate legend dimensions
+
     max_text_width = 0
     for class_id, class_name in settings.class_names.items():
         (text_w, _), _ = cv2.getTextSize(class_name, font, font_scale, font_thickness)
@@ -114,8 +117,7 @@ def draw_legend(
     
     legend_width = max_text_width + 40  # color box + padding
     legend_height = len(settings.class_names) * item_height + padding * 2
-    
-    # Calculate position
+
     h, w = frame.shape[:2]
     if position == "top-left":
         x, y = padding, padding
@@ -156,70 +158,6 @@ def draw_legend(
             font_thickness,
             cv2.LINE_AA
         )
-        
-    return annotated
 
-
-def draw_stats(
-    frame: np.ndarray,
-    stats: dict,
-    position: str = "top-right"
-) -> np.ndarray:
-    """Draw detection stats on frame.
-    
-    Args:
-        frame: Input frame
-        stats: Dictionary with stats (e.g., {"fps": 30, "detections": 15})
-        position: Stats position
-        
-    Returns:
-        Frame with stats overlay
-    """
-    annotated = frame.copy()
-    
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    font_thickness = 1
-    
-    lines = [f"{k}: {v}" for k, v in stats.items()]
-    
-    # Calculate dimensions
-    max_width = 0
-    line_height = 20
-    for line in lines:
-        (text_w, _), _ = cv2.getTextSize(line, font, font_scale, font_thickness)
-        max_width = max(max_width, text_w)
-    
-    box_width = max_width + 20
-    box_height = len(lines) * line_height + 15
-    
-    h, w = frame.shape[:2]
-    if "right" in position:
-        x = w - box_width - 10
-    else:
-        x = 10
-    if "bottom" in position:
-        y = h - box_height - 10
-    else:
-        y = 10
-    
-    # Draw background
-    overlay = annotated.copy()
-    cv2.rectangle(overlay, (x, y), (x + box_width, y + box_height), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.7, annotated, 0.3, 0, annotated)
-    
-    # Draw text
-    for i, line in enumerate(lines):
-        cv2.putText(
-            annotated,
-            line,
-            (x + 10, y + 18 + i * line_height),
-            font,
-            font_scale,
-            (255, 255, 255),
-            font_thickness,
-            cv2.LINE_AA
-        )
-        
     return annotated
 
