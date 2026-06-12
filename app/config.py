@@ -4,23 +4,38 @@ from functools import lru_cache
 
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent
-DEFAULT_MODEL_PATH = str(PROJECT_ROOT / "models" / "best.onnx")
 
 
 class Settings(BaseSettings):
-    """Application settings."""
+    """Application settings.
+
+    Model artifact paths/sources are NOT configured here — they live in
+    ``app.utils.models_registry`` (single source of truth). Use the
+    ``MODELS__{NAME}__PATH`` env override for ad-hoc model paths.
+    """
     
     # App
     app_name: str = "SoccerGSR ML Service"
     debug: bool = True
     
-    # Model
-    model_path: str = DEFAULT_MODEL_PATH  # Will be downloaded automatically if missing
-    model_gdrive_id: str = "1OA6l1GEb6ki5Dq2zSmJgH4AcEkbYvisq"  # Google Drive file ID
-    model_auto_download: bool = True  # Auto-download model if not found
+    # Detector backend selection: "deimv2" (DEIMv2-DINOv3 M@896, DETR-style) or
+    # "yolo" (legacy YOLOv5lu@1280). Override via env DETECTOR_BACKEND.
+    detector_backend: str = "deimv2"
+
+    # Auto-download registered models on startup (see models_registry.REGISTRY)
+    model_auto_download: bool = True
+
+    # YOLO detector (legacy backend)
     model_input_size: int = 1280
     confidence_threshold: float = 0.25
     iou_threshold: float = 0.45
+
+    # DEIMv2 detector (DETR-style, postproc baked into the graph, no NMS).
+    # Trained with num_classes=5 where index 0 is background; service cls_id =
+    # model_label - 1 (0=player, 1=goalkeeper, 2=referee, 3=ball).
+    deimv2_input_size: int = 896
+    deimv2_confidence_threshold: float = 0.4
+    deimv2_model_size: str = "m"  # affects normalization (s/m/l/x use ImageNet)
     
     # Database
     database_url: str = "sqlite+aiosqlite:///./soccer_gsr.db"
@@ -29,9 +44,6 @@ class Settings(BaseSettings):
     secret_key: str = "your-super-secret-key-change-in-production"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
-    
-    # Admin token for DELETE /history
-    admin_delete_token: str = "admin-delete-token-change-in-production"
     
     # Video processing
     max_video_size_mb: int = 100

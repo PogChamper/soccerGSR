@@ -29,16 +29,7 @@ async def create_history_entry(
     balls_count: Optional[int] = None,
     user_id: Optional[int] = None
 ) -> RequestHistory:
-    """Create a new history entry.
-    
-    Args:
-        db: Database session
-        status: Request status ('success' or 'error')
-        ... other parameters
-        
-    Returns:
-        Created RequestHistory object
-    """
+    """Create and persist a history entry."""
     entry = RequestHistory(
         request_id=str(uuid4()),
         timestamp=datetime.utcnow(),
@@ -74,18 +65,7 @@ async def get_history(
     offset: int = 0,
     status_filter: Optional[str] = None
 ) -> tuple[List[RequestHistory], int]:
-    """Get history entries with pagination.
-    
-    Args:
-        db: Database session
-        limit: Maximum entries to return
-        offset: Offset for pagination
-        status_filter: Optional status filter
-        
-    Returns:
-        Tuple of (history entries, total count)
-    """
-    # Build query
+    """Return (entries page, total count), newest first."""
     query = select(RequestHistory).order_by(RequestHistory.timestamp.desc())
     count_query = select(func.count(RequestHistory.id))
     
@@ -93,11 +73,9 @@ async def get_history(
         query = query.where(RequestHistory.status == status_filter)
         count_query = count_query.where(RequestHistory.status == status_filter)
     
-    # Get total count
     total_result = await db.execute(count_query)
     total = total_result.scalar()
     
-    # Get paginated results
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     entries = result.scalars().all()
@@ -106,19 +84,10 @@ async def get_history(
 
 
 async def delete_all_history(db: AsyncSession) -> int:
-    """Delete all history entries.
-    
-    Args:
-        db: Database session
-        
-    Returns:
-        Number of deleted entries
-    """
-    # Get count first
+    """Delete all history entries, return how many were deleted."""
     count_result = await db.execute(select(func.count(RequestHistory.id)))
     count = count_result.scalar()
     
-    # Delete all
     await db.execute(delete(RequestHistory))
     await db.commit()
     
@@ -126,21 +95,12 @@ async def delete_all_history(db: AsyncSession) -> int:
 
 
 async def get_stats(db: AsyncSession) -> Dict[str, Any]:
-    """Calculate statistics from history.
-    
-    Args:
-        db: Database session
-        
-    Returns:
-        Dictionary with statistics
-    """
-    # Get all successful entries for stats
+    """Aggregate statistics over the request history."""
     result = await db.execute(
         select(RequestHistory).where(RequestHistory.status == "success")
     )
     successful_entries = result.scalars().all()
     
-    # Get counts
     total_result = await db.execute(select(func.count(RequestHistory.id)))
     total_requests = total_result.scalar()
     
@@ -151,7 +111,6 @@ async def get_stats(db: AsyncSession) -> Dict[str, Any]:
     
     failed_requests = total_requests - successful_requests
     
-    # Calculate processing time stats
     processing_times = [e.processing_time for e in successful_entries if e.processing_time is not None]
     
     if processing_times:
@@ -164,7 +123,6 @@ async def get_stats(db: AsyncSession) -> Dict[str, Any]:
     else:
         processing_time_stats = {"mean": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0}
     
-    # Calculate input characteristics
     durations = [e.input_duration for e in successful_entries if e.input_duration is not None]
     sizes = [e.input_size_mb for e in successful_entries if e.input_size_mb is not None]
     
@@ -184,7 +142,6 @@ async def get_stats(db: AsyncSession) -> Dict[str, Any]:
             "p95": float(np.percentile(sizes, 95))
         }
     
-    # Resolution distribution
     resolution_counts = {}
     for e in successful_entries:
         if e.input_width and e.input_height:
@@ -195,7 +152,6 @@ async def get_stats(db: AsyncSession) -> Dict[str, Any]:
     if resolution_counts:
         most_common_resolution = max(resolution_counts, key=resolution_counts.get)
     
-    # Detection stats
     total_detections = sum(e.total_detections or 0 for e in successful_entries)
     total_frames = sum(e.frames_processed or 0 for e in successful_entries)
     avg_per_frame = total_detections / total_frames if total_frames > 0 else 0.0
@@ -205,7 +161,6 @@ async def get_stats(db: AsyncSession) -> Dict[str, Any]:
     referees_total = sum(e.referees_count or 0 for e in successful_entries)
     balls_total = sum(e.balls_count or 0 for e in successful_entries)
     
-    # Average per frame by class
     detection_by_class = {}
     if total_frames > 0:
         detection_by_class = {

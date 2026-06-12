@@ -114,23 +114,14 @@ async def register(
     user_data: UserCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Register a new user.
-    
-    Args:
-        user_data: User registration data
-        
-    Returns:
-        Created user info
-    """
-    # Check if username exists
+    """Register a new (non-admin) user."""
     existing_user = await get_user_by_username(db, user_data.username)
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already registered"
         )
-    
-    # Create user
+
     user = User(
         username=user_data.username,
         password_hash=get_password_hash(user_data.password),
@@ -149,14 +140,7 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
 ):
-    """Login and get JWT token.
-    
-    Args:
-        form_data: OAuth2 form with username and password
-        
-    Returns:
-        JWT access token
-    """
+    """Login and get a JWT access token."""
     user = await authenticate_user(db, form_data.username, form_data.password)
     
     if not user:
@@ -181,11 +165,7 @@ async def login(
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
-    """Get current user info.
-    
-    Returns:
-        Current user info
-    """
+    """Current user info."""
     if current_user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
