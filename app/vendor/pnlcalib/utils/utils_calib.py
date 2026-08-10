@@ -1,13 +1,11 @@
 import sys
 import cv2
-import copy
 import itertools
 import numpy as np
 
-from itertools import chain
 from scipy.optimize import least_squares
 
-from .utils_optimize import vector_to_mtx,  point_to_line_distance, get_opt_vector, line_plane_intersection, \
+from .utils_optimize import vector_to_mtx, point_to_line_distance, get_opt_vector, line_plane_intersection, \
                                     plane_from_P, plane_from_H
 
 

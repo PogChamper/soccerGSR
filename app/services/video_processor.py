@@ -1,19 +1,13 @@
-"""Two-pass GSR video processor.
+"""Offline video processing and result rendering."""
 
-Pass1     — per-frame raw observations (detections, tracks, jersey logits,
-            keypoints/lines) into ClipState. GPU-bound.
-Aggregate — per-clip post-processing (merge, jersey, calibration, teams,
-            smoothing).
-Pass2     — render annotated mp4 (bbox + track_id + jersey + minimap).
-"""
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Optional, Tuple
+from collections import Counter
+from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -33,39 +27,59 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-ProgressCb = Callable[[str, float], None]
+DEFAULT_FPS = 25.0
+ProgressCallback = Callable[[str, float], None]
 
 
-@dataclass
-class ProcessingStats:
-    processing_time: float = 0.0
-    pass1_time: float = 0.0
-    aggregate_time: float = 0.0
-    pass2_time: float = 0.0
-    frames_processed: int = 0
-    total_detections: int = 0
-    players_count: int = 0
-    goalkeepers_count: int = 0
-    referees_count: int = 0
-    balls_count: int = 0
-    n_tracks: int = 0
-    n_tracks_with_jersey: int = 0
-    n_frames_calibrated: int = 0
+def _finite_float(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def read_metadata(video_path: str) -> ClipMeta:
+    """Read validated container metadata."""
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video file: {video_path}")
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-    cap.release()
-    duration = frame_count / fps if fps > 0 else 0.0
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video file: {video_path}")
+
+        width_value = _finite_float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height_value = _finite_float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width_value is None or height_value is None:
+            raise ValueError(f"Invalid video dimensions: {video_path}")
+
+        width = int(width_value)
+        height = int(height_value)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid video dimensions: {video_path}")
+
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps_value = _finite_float(raw_fps)
+        if fps_value is None or fps_value <= 0:
+            logger.warning(
+                "invalid video FPS for %s (%r); using %.1f",
+                video_path,
+                raw_fps,
+                DEFAULT_FPS,
+            )
+            fps = DEFAULT_FPS
+        else:
+            fps = fps_value
+
+        frame_count_value = _finite_float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_count = max(0, int(frame_count_value)) if frame_count_value is not None else 0
+        fourcc_value = _finite_float(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc = max(0, int(fourcc_value)) if fourcc_value is not None else 0
+    finally:
+        cap.release()
+
+    duration = frame_count / fps
     size_bytes = os.path.getsize(video_path)
-    codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
+    codec_bytes = bytes((fourcc >> (8 * index)) & 0xFF for index in range(4))
+    codec = codec_bytes.rstrip(b"\x00").decode("ascii", errors="replace")
     return ClipMeta(
         filename=os.path.basename(video_path),
         width=width,
@@ -78,7 +92,7 @@ def read_metadata(video_path: str) -> ClipMeta:
     )
 
 
-def _foot_xy(bbox_xyxy: Tuple[float, float, float, float]) -> Tuple[float, float]:
+def _foot_xy(bbox_xyxy: tuple[float, float, float, float]) -> tuple[float, float]:
     x1, y1, x2, y2 = bbox_xyxy
     return ((x1 + x2) / 2.0, y2)
 
@@ -88,22 +102,46 @@ def _class_name(cls_id: int) -> str:
 
 
 class _FFmpegSink:
-    """Write BGR frames to H.264 via an ffmpeg pipe (crisp, small files)."""
+    """Write BGR frames to H.264 through an ffmpeg pipe."""
 
     def __init__(self, path, fps, width, height):
         import subprocess
 
-        fps_str = f"{float(fps):.6g}" if fps else "25"
+        fps_value = _finite_float(fps)
+        fps_str = f"{fps_value if fps_value and fps_value > 0 else DEFAULT_FPS:.6g}"
         cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", fps_str, "-i", "-",
-            "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path),
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            fps_str,
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
         ]
         self._proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
 
     def _stderr_tail(self) -> str:
@@ -140,7 +178,7 @@ class _Cv2Sink:
 
 
 def _make_video_sink(path, fps, width, height):
-    """Return a video sink (ffmpeg H.264 if available, else cv2 mp4v)."""
+    """Create an H.264 sink, falling back to OpenCV MP4V."""
     import shutil
 
     if shutil.which("ffmpeg"):
@@ -149,37 +187,26 @@ def _make_video_sink(path, fps, width, height):
             logger.info("pass2: writing with ffmpeg/libx264 (crf 18)")
             return sink
         except Exception as exc:
-            logger.warning(f"pass2: ffmpeg sink failed ({exc}); using cv2 mp4v")
-    writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
+            logger.warning("pass2: ffmpeg sink failed (%s); using cv2 mp4v", exc)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():
         return None
     logger.info("pass2: writing with cv2 mp4v")
     return _Cv2Sink(writer)
 
 
-def majority_class(obs_list) -> int:
-    """Confidence-weighted majority class for a track.
+def majority_class(observations: list[FrameObservation]) -> int:
+    """Return the temporal majority detector class for a track.
 
-    Using a per-frame argmax for the displayed class makes the label/shape
-    flicker (e.g. referee<->player on a referee in black, or a purple GK read
-    as referee on some frames). Voting over the whole track with detection
-    confidence as weight gives one stable, more confident class per identity.
+    This is the single canonical role used by team assignment, rendering, and
+    JSON output. A deterministic class-id tie break keeps runs stable.
     """
-    votes: dict = {}
-    for o in obs_list:
-        w = (o.det_confidence or 0.0) + 0.05
-        votes[o.cls_id] = votes.get(o.cls_id, 0.0) + w
-    return max(votes, key=votes.get) if votes else 0
+    votes = Counter(observation.cls_id for observation in observations)
+    return min(votes, key=lambda class_id: (-votes[class_id], class_id)) if votes else 0
 
 
 class VideoProcessor:
-    """Two-pass orchestrator. Per-clip stateful phases come in as factories
-    (tracker, team classifier, calibrator), shared stateless ones as
-    instances. ``tracker_factory`` takes the clip fps (BoT-SORT scales its
-    lost-track buffer by frame rate). Any phase may be None to disable it.
-    """
+    """Run frame inference, clip aggregation, and result rendering."""
 
     def __init__(
         self,
@@ -203,29 +230,27 @@ class VideoProcessor:
         self.calibrator_factory = calibrator_factory
         self.embedder = embedder
         self.minimap_renderer = minimap_renderer
-        os.makedirs(settings.temp_dir, exist_ok=True)
-
-    # ------------------------------------------------------------------ pass 1
+        os.makedirs(settings.artifact_dir, exist_ok=True)
 
     def pass1(
         self,
         input_path: str,
         state: ClipState,
-        progress_cb: Optional[ProgressCb] = None,
+        progress_cb: ProgressCallback | None = None,
         *,
         tracker=None,
         team_classifier=None,
     ) -> None:
-        """Iterate frames, fill state.observations / state.frames raw fields."""
+        """Collect frame observations and calibration evidence."""
         if tracker is None and self.tracker_factory is not None:
             tracker = self.tracker_factory(state.meta.fps)
         cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {input_path}")
-
-        frame_idx = 0
-        last_log = time.time()
         try:
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {input_path}")
+
+            frame_idx = 0
+            last_log = time.time()
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -239,9 +264,7 @@ class VideoProcessor:
 
                 detections = self.detector.detect(frame)
 
-                # One batched embedding pass per frame, all classes: ball/ref
-                # crops are overkill but cheap, and BoT-SORT's appearance
-                # gate then works uniformly.
+                # BoT-SORT expects one feature row per detection.
                 embeddings = None
                 if self.embedder is not None and detections:
                     bboxes = [tuple(d.bbox) for d in detections]
@@ -251,6 +274,20 @@ class VideoProcessor:
                     tracked = tracker.update(detections, frame, embeddings=embeddings)
                 else:
                     tracked = [(det, None) for det in detections]
+
+                jersey_results = {}
+                if self.jersey_recognizer is not None:
+                    jersey_indices = [
+                        index
+                        for index, (detection, track_id) in enumerate(tracked)
+                        if detection.class_id in (0, 1) and track_id is not None
+                    ]
+                    if jersey_indices:
+                        batch_results = self.jersey_recognizer.process_boxes(
+                            frame,
+                            [tracked[index][0].bbox for index in jersey_indices],
+                        )
+                        jersey_results = dict(zip(jersey_indices, batch_results))
 
                 for det_idx, (det, track_id) in enumerate(tracked):
                     obs = FrameObservation(
@@ -262,12 +299,8 @@ class VideoProcessor:
                         foot_xy_image=_foot_xy(det.bbox),
                     )
 
-                    if (
-                        self.jersey_recognizer is not None
-                        and det.class_id in (0, 1)        # players + goalkeepers
-                        and track_id is not None
-                    ):
-                        jr = self.jersey_recognizer.process_crop(frame, det.bbox)
+                    if det_idx in jersey_results:
+                        jr = jersey_results[det_idx]
                         obs.visibility_p = jr.visibility_p
                         obs.ocr_logits_tens = jr.ocr_logits_tens
                         obs.ocr_logits_units = jr.ocr_logits_units
@@ -282,9 +315,7 @@ class VideoProcessor:
                             if embeddings is not None and det_idx < len(embeddings)
                             else None
                         )
-                        team_classifier.observe(
-                            track_id, emb, det.class_id, frame=frame, bbox=det.bbox
-                        )
+                        team_classifier.observe(track_id, emb)
 
                     state.observations.append(obs)
 
@@ -299,13 +330,14 @@ class VideoProcessor:
                 now = time.time()
                 if now - last_log > 5.0:
                     pct = (
-                        100.0 * frame_idx / state.meta.frame_count
-                        if state.meta.frame_count
-                        else 0
+                        100.0 * frame_idx / state.meta.frame_count if state.meta.frame_count else 0
                     )
                     logger.info(
-                        f"pass1: {frame_idx}/{state.meta.frame_count} "
-                        f"({pct:.1f}%) detections={len(state.observations)}"
+                        "pass1: %d/%d (%.1f%%) observations=%d",
+                        frame_idx,
+                        state.meta.frame_count,
+                        pct,
+                        len(state.observations),
                     )
                     last_log = now
                     if progress_cb is not None:
@@ -313,22 +345,27 @@ class VideoProcessor:
         finally:
             cap.release()
 
+        if state.meta.frame_count != frame_idx:
+            logger.warning(
+                "container frame count corrected: reported=%d decoded=%d",
+                state.meta.frame_count,
+                frame_idx,
+            )
+            state.meta.frame_count = frame_idx
+            state.meta.duration = frame_idx / state.meta.fps
+
         if progress_cb is not None:
             progress_cb("pass1", 100.0)
-
-    # ----------------------------------------------------------- aggregate
 
     def aggregate(
         self,
         state: ClipState,
-        progress_cb: Optional[ProgressCb] = None,
+        progress_cb: ProgressCallback | None = None,
         *,
         team_classifier=None,
         calibrator=None,
     ) -> None:
-        """Build TrackInfo per track, run team clustering / jersey aggregation /
-        calibration."""
-        from collections import Counter
+        """Aggregate raw observations into calibrated, merged identities."""
 
         by_track = state.observations_by_track()
         for tid, obs_list in by_track.items():
@@ -341,43 +378,42 @@ class VideoProcessor:
                 first_frame=obs_list[0].frame_idx,
                 last_frame=obs_list[-1].frame_idx,
                 n_frames_visible_gate=sum(
-                    1 for o in obs_list
-                    if o.visibility_p is not None and o.visibility_p > 0.5
+                    1 for o in obs_list if o.visibility_p is not None and o.visibility_p > 0.5
                 ),
             )
 
-        # Collect raw jersey votes per fragment; the authoritative number is
-        # committed after the merge from each identity's pooled votes.
+        # A provisional number is useful as a high-precision merge anchor. The
+        # final number is committed from pooled evidence after merging.
         if self.jersey_recognizer is not None:
             self.jersey_recognizer.collect_votes_into_tracks(state)
 
-        # Merge fragmented tracks before team clustering (one identity = one
-        # set of colour samples); remap_tracks keeps classifier state in sync.
-        if team_classifier is not None:
-            from app.services.track_merger import merge_tracks
-
-            n_before = len(state.tracks)
-            mapping = merge_tracks(state, embedder_source=team_classifier)
-            n_after = len(state.tracks)
-            if mapping:
-                team_classifier.remap_tracks(mapping)
-                logger.info(
-                    f"track_merger: {n_before} -> {n_after} tracks "
-                    f"({n_before - n_after} consolidated)"
-                )
-
-        # Now commit jersey numbers on the merged (pooled-vote) identities.
-        if self.jersey_recognizer is not None:
-            self.jersey_recognizer.commit_numbers(state)
-
+        # Offline merging needs team and pitch-space motion. Both are estimated
+        # on raw fragments first, then recomputed on the merged identities.
         if calibrator is not None:
             calibrator.calibrate(state)
 
         if team_classifier is not None:
             team_classifier.fit_and_assign(state)
 
-        # Jersey dedup needs team assignment: numbers are only unique within
-        # a team (both teams routinely field a #10).
+        from app.services.track_merger import merge_tracks
+
+        n_before = len(state.tracks)
+        mapping = merge_tracks(state, embedder_source=team_classifier)
+        if mapping:
+            if team_classifier is not None:
+                team_classifier.remap_tracks(mapping)
+            logger.info(
+                "track merger: %d -> %d identities",
+                n_before,
+                len(state.tracks),
+            )
+
+        if self.jersey_recognizer is not None:
+            self.jersey_recognizer.commit_numbers(state)
+
+        if team_classifier is not None:
+            team_classifier.fit_and_assign(state)
+
         if self.jersey_recognizer is not None:
             self.jersey_recognizer.dedup_numbers(state)
 
@@ -385,19 +421,15 @@ class VideoProcessor:
             from app.services.track_smoother import (
                 filter_ball_outliers,
                 interpolate_track_gaps,
-                smooth_detection_class,
                 smooth_pitch_xy,
             )
+
             filter_ball_outliers(state)
             smooth_pitch_xy(state)
-            smooth_detection_class(state)
-            # gap-fill last, so synthetic points aren't fed to the smoother
-            interpolate_track_gaps(state)
+            interpolate_track_gaps(state, max_frame_delta=10)
 
         if progress_cb is not None:
             progress_cb("aggregate", 100.0)
-
-    # ---------------------------------------------------------------- pass 2
 
     def pass2(
         self,
@@ -406,27 +438,31 @@ class VideoProcessor:
         state: ClipState,
         *,
         draw_legend_flag: bool = True,
-        progress_cb: Optional[ProgressCb] = None,
+        progress_cb: ProgressCallback | None = None,
     ) -> None:
         """Render annotated video using state filled by pass1+aggregate."""
         if self.minimap_renderer is not None:
-            # the renderer is shared across jobs; its snap-cache / frozen-frame
-            # state is clip-scoped and must not leak from the previous clip
             self.minimap_renderer.reset_clip_state()
         cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {input_path}")
-        sink = _make_video_sink(
-            output_path, state.meta.fps, state.meta.width, state.meta.height
-        )
-        if sink is None:
-            cap.release()
-            raise ValueError(f"Cannot create output video: {output_path}")
-
-        obs_by_frame = state.observations_by_frame()
-        last_log = time.time()
+        processing_failed = False
+        sink = None
 
         try:
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {input_path}")
+
+            obs_by_frame = state.observations_by_frame()
+            known_frames = {frame.frame_idx for frame in state.frames}
+            last_log = time.time()
+            sink = _make_video_sink(
+                output_path,
+                state.meta.fps,
+                state.meta.width,
+                state.meta.height,
+            )
+            if sink is None:
+                raise ValueError(f"Cannot create output video: {output_path}")
+
             frame_idx = 0
             while True:
                 ret, frame = cap.read()
@@ -434,18 +470,12 @@ class VideoProcessor:
                     break
 
                 obs_list = obs_by_frame.get(frame_idx, [])
-                # synthetic gap-fill obs are minimap-only; never draw them as
-                # fabricated bounding boxes on the main video.
+                # Interpolated observations are only rendered on the minimap.
                 real_obs = [o for o in obs_list if not o.synthetic]
                 detections = []
                 for obs in real_obs:
                     tr = state.tracks.get(obs.track_id)
-                    # space-time-voted class (track-independent) wins; falls back
-                    # to the stable per-track class so labels/colors don't flicker
-                    if obs.display_cls is not None:
-                        scid = obs.display_cls
-                    else:
-                        scid = tr.cls_id if tr is not None else obs.cls_id
+                    scid = tr.cls_id if tr is not None else obs.cls_id
                     detections.append(
                         Detection(
                             bbox=obs.bbox_xyxy,
@@ -463,7 +493,8 @@ class VideoProcessor:
                             "team_id": obs.team_id,
                             "jersey_number": (
                                 state.tracks[obs.track_id].jersey_number
-                                if obs.track_id in state.tracks else None
+                                if obs.track_id in state.tracks
+                                else None
                             ),
                         }
                         for obs in real_obs
@@ -473,13 +504,8 @@ class VideoProcessor:
                 if draw_legend_flag:
                     annotated = draw_legend(annotated)
 
-                if self.minimap_renderer is not None and frame_idx < len(state.frames):
-                    annotated = self.minimap_renderer.overlay(
-                        annotated,
-                        state.frames[frame_idx],
-                        obs_list,
-                        state.tracks,
-                    )
+                if self.minimap_renderer is not None and frame_idx in known_frames:
+                    annotated = self.minimap_renderer.overlay(annotated, obs_list, state.tracks)
 
                 sink.write(annotated)
                 frame_idx += 1
@@ -487,64 +513,84 @@ class VideoProcessor:
                 now = time.time()
                 if now - last_log > 5.0:
                     pct = (
-                        100.0 * frame_idx / state.meta.frame_count
-                        if state.meta.frame_count
-                        else 0
+                        100.0 * frame_idx / state.meta.frame_count if state.meta.frame_count else 0
                     )
                     logger.info(
-                        f"pass2: {frame_idx}/{state.meta.frame_count} ({pct:.1f}%)"
+                        "pass2: %d/%d (%.1f%%)",
+                        frame_idx,
+                        state.meta.frame_count,
+                        pct,
                     )
                     last_log = now
                     if progress_cb is not None:
                         progress_cb("pass2", pct)
+
+            if frame_idx != state.meta.frame_count:
+                raise RuntimeError(
+                    f"render decoded {frame_idx} frames; expected {state.meta.frame_count}"
+                )
+        except BaseException:
+            processing_failed = True
+            raise
         finally:
-            sink.release()
-            cap.release()
+            cleanup_error = None
+            try:
+                cap.release()
+            except Exception as exc:
+                if processing_failed:
+                    logger.exception("video capture cleanup failed after processing error")
+                else:
+                    cleanup_error = exc
+
+            if sink is not None:
+                try:
+                    sink.release()
+                except Exception as exc:
+                    if processing_failed:
+                        logger.exception("video sink cleanup failed after processing error")
+                    elif cleanup_error is not None:
+                        logger.exception("video sink cleanup failed after capture cleanup error")
+                    else:
+                        cleanup_error = exc
+
+            if cleanup_error is not None:
+                raise cleanup_error
 
         if progress_cb is not None:
             progress_cb("pass2", 100.0)
 
-    # -------------------------------------------------------------- top-level
-
     def process_video(
         self,
         input_path: str,
-        output_path: Optional[str] = None,
+        output_path: str,
         *,
+        source_filename: str | None = None,
         draw_legend_flag: bool = True,
-        progress_cb: Optional[ProgressCb] = None,
-    ) -> Tuple[str, ClipState, ProcessingStats]:
-        """Run pass1 -> aggregate -> pass2. Returns (output_path, state, stats)."""
+        progress_cb: ProgressCallback | None = None,
+    ) -> tuple[str, ClipState]:
+        """Run both passes and clip-level aggregation."""
         meta = read_metadata(input_path)
+        if source_filename:
+            meta.filename = source_filename
         state = ClipState(meta=meta)
-        stats = ProcessingStats()
-
-        if output_path is None:
-            output_path = os.path.join(
-                settings.temp_dir,
-                f"output_{int(time.time())}_{meta.filename}",
-            )
-            if not output_path.endswith(".mp4"):
-                output_path = os.path.splitext(output_path)[0] + ".mp4"
 
         logger.info(
-            f"GSR pipeline start: {meta.filename} "
-            f"({meta.frame_count} frames, {meta.duration:.1f}s, {meta.width}x{meta.height})"
+            "pipeline start: file=%s frames=%d duration=%.1fs resolution=%dx%d",
+            meta.filename,
+            meta.frame_count,
+            meta.duration,
+            meta.width,
+            meta.height,
         )
 
-        # Per-clip services that need state shared between pass1 and aggregate.
         tracker = self.tracker_factory(meta.fps) if self.tracker_factory else None
-        team_classifier = (
-            self.team_classifier_factory() if self.team_classifier_factory else None
-        )
+        team_classifier = self.team_classifier_factory() if self.team_classifier_factory else None
         calibrator = (
-            self.calibrator_factory(meta.width, meta.height)
-            if self.calibrator_factory
-            else None
+            self.calibrator_factory(meta.width, meta.height) if self.calibrator_factory else None
         )
 
-        t_total = time.time()
-        t = time.time()
+        started = time.perf_counter()
+        stage_started = time.perf_counter()
         self.pass1(
             input_path,
             state,
@@ -552,18 +598,18 @@ class VideoProcessor:
             tracker=tracker,
             team_classifier=team_classifier,
         )
-        stats.pass1_time = time.time() - t
+        pass1_time = time.perf_counter() - stage_started
 
-        t = time.time()
+        stage_started = time.perf_counter()
         self.aggregate(
             state,
             progress_cb,
             team_classifier=team_classifier,
             calibrator=calibrator,
         )
-        stats.aggregate_time = time.time() - t
+        aggregate_time = time.perf_counter() - stage_started
 
-        t = time.time()
+        stage_started = time.perf_counter()
         self.pass2(
             input_path,
             output_path,
@@ -571,36 +617,22 @@ class VideoProcessor:
             draw_legend_flag=draw_legend_flag,
             progress_cb=progress_cb,
         )
-        stats.pass2_time = time.time() - t
+        pass2_time = time.perf_counter() - stage_started
 
-        # ---- summarise stats ----
-        stats.frames_processed = len(state.frames)
-        stats.total_detections = len(state.observations)
-        for obs in state.observations:
-            if obs.cls_id == 0:
-                stats.players_count += 1
-            elif obs.cls_id == 1:
-                stats.goalkeepers_count += 1
-            elif obs.cls_id == 2:
-                stats.referees_count += 1
-            elif obs.cls_id == 3:
-                stats.balls_count += 1
-        stats.n_tracks = len(state.tracks)
-        stats.n_tracks_with_jersey = sum(
-            1 for t in state.tracks.values() if t.jersey_number is not None
-        )
-        stats.n_frames_calibrated = sum(
-            1 for f in state.frames if f.homography_world_to_image is not None
-        )
-        stats.processing_time = time.time() - t_total
-
+        jersey_tracks = sum(1 for track in state.tracks.values() if track.jersey_number is not None)
+        calibrated_frames = sum(1 for f in state.frames if f.homography_world_to_image is not None)
         logger.info(
-            f"GSR pipeline done: {stats.processing_time:.1f}s "
-            f"(p1={stats.pass1_time:.1f} agg={stats.aggregate_time:.1f} "
-            f"p2={stats.pass2_time:.1f}) "
-            f"frames={stats.frames_processed} dets={stats.total_detections} "
-            f"tracks={stats.n_tracks} jerseys={stats.n_tracks_with_jersey} "
-            f"calibrated={stats.n_frames_calibrated}"
+            "pipeline complete: total=%.1fs pass1=%.1fs aggregate=%.1fs pass2=%.1fs "
+            "frames=%d observations=%d tracks=%d jerseys=%d calibrated=%d",
+            time.perf_counter() - started,
+            pass1_time,
+            aggregate_time,
+            pass2_time,
+            len(state.frames),
+            len(state.observations),
+            len(state.tracks),
+            jersey_tracks,
+            calibrated_frames,
         )
 
-        return output_path, state, stats
+        return output_path, state

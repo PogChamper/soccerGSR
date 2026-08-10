@@ -1,111 +1,69 @@
-from datetime import datetime
-from typing import Optional
-from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, Boolean, 
-    Text, ForeignKey, create_engine
-)
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, relationship
+"""SQLite persistence for local asynchronous jobs."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
+from sqlalchemy import DateTime, Float, Index, Integer, String, Text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.config import get_settings
 
-Base = declarative_base()
-settings = get_settings()
+
+def utc_now() -> datetime:
+    """Return naive UTC for SQLite storage; API serialization restores UTC."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
-class User(Base):
-    """User model for JWT authentication (PRO)."""
-    
-    __tablename__ = "users"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)
-    is_admin = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationship to request history
-    requests = relationship("RequestHistory", back_populates="user")
-
-
-class RequestHistory(Base):
-    """Request history model."""
-    
-    __tablename__ = "request_history"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    request_id = Column(String(36), unique=True, nullable=False, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    status = Column(String(20), nullable=False)  # success, error
-    error_message = Column(Text, nullable=True)
-    
-    # Input characteristics
-    input_filename = Column(String(255), nullable=True)
-    input_size_mb = Column(Float, nullable=True)
-    input_width = Column(Integer, nullable=True)
-    input_height = Column(Integer, nullable=True)
-    input_duration = Column(Float, nullable=True)  # seconds
-    input_fps = Column(Float, nullable=True)
-    input_frames = Column(Integer, nullable=True)
-    
-    # Processing stats
-    processing_time = Column(Float, nullable=True)  # seconds
-    frames_processed = Column(Integer, nullable=True)
-    
-    # Detection results (aggregates)
-    total_detections = Column(Integer, nullable=True)
-    players_count = Column(Integer, nullable=True)
-    goalkeepers_count = Column(Integer, nullable=True)
-    referees_count = Column(Integer, nullable=True)
-    balls_count = Column(Integer, nullable=True)
-    
-    # User reference
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    user = relationship("User", back_populates="requests")
+class Base(DeclarativeBase):
+    pass
 
 
 class Job(Base):
-    """Async GSR job. Owns its own input/output files on disk."""
+    """Persistent state for one offline processing job."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index("ix_jobs_created_at", "created_at"),
+        Index("ix_jobs_status", "status"),
+    )
 
-    id = Column(Integer, primary_key=True, index=True)
-    job_id = Column(String(36), unique=True, nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    started_at = Column(DateTime, nullable=True)
-    finished_at = Column(DateTime, nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(),
+        default=utc_now,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime())
 
-    status = Column(String(20), nullable=False, default="queued", index=True)
-    # queued | running | done | error | cancelled
-    stage = Column(String(20), nullable=True)
-    # pass1 | aggregate | pass2 | done
-    progress = Column(Float, nullable=True)         # 0.0 .. 100.0 within stage
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    stage: Mapped[str | None] = mapped_column(String(20))
+    progress: Mapped[float | None] = mapped_column(Float)
 
-    input_filename = Column(String(255), nullable=True)
-    input_path = Column(Text, nullable=True)
-    output_video_path = Column(Text, nullable=True)
-    # GSR JSON is stored on disk (job_worker.gsr_json_path), not in the DB
-
-    error_message = Column(Text, nullable=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    input_filename: Mapped[str | None] = mapped_column(String(255))
+    input_path: Mapped[str | None] = mapped_column(Text)
+    output_video_path: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
 
 
-# Async engine and session
+settings = get_settings()
 engine = create_async_engine(settings.database_url, echo=settings.debug)
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def init_db():
-    """Initialize database tables."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+async def init_db() -> None:
+    """Create the local schema when it does not exist."""
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
 
-async def get_db() -> AsyncSession:
-    """Get database session."""
+async def close_db() -> None:
+    await engine.dispose()
+
+
+async def get_db() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
+        yield session

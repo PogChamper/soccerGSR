@@ -1,286 +1,351 @@
-"""Jersey number recognition: visibility gate -> two-head OCR -> per-track
-weighted voting (collect per fragment, commit per merged identity, dedup per
-team)."""
+"""Batched jersey recognition and per-identity temporal voting."""
+
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+from app.config import get_settings
 from app.services.clip_state import ClipState
 from app.utils.cuda_env import get_providers
 from app.utils.models_registry import ensure_model
 
 logger = logging.getLogger(__name__)
 
-
-VIS_THRESHOLD = 0.6                  # visibility classifier output threshold
-MIN_PER_FRAME_OCR_CONF = 0.7         # drop per-frame OCR results below this
-MIN_VOTES_FOR_NUMBER = 4             # need at least N high-conf frames to commit
-# Floor on the winning number's accumulated weight (one good frame adds
-# ~0.5-0.9); rejects numbers supported by a handful of weak frames.
-MIN_TOP_WEIGHT = 4.0
-# Winner must beat the best alternative by this ratio — the primary
-# discriminator, robust to a long tail of scattered OCR noise.
-MARGIN_RATIO = 2.0
-# Low floor on winner's share of total votes; only rejects flat distributions
-# (MARGIN_RATIO already covers the noisy-tail case).
-MIN_CONFIDENCE_FOR_NUMBER = 0.35
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_GATE_IMAGE_SIZE = 128
+_OCR_IMAGE_SIZE = 224
+_DIGIT_CLASSES = 10
+_IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
+_IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class JerseyVoteConfig:
+    """Thresholds validated on the GSR validation split."""
+
+    visibility_threshold: float = 0.7
+    min_digit_confidence: float = 0.9
+    min_votes: int = 6
+
+
+@dataclass(slots=True)
 class JerseyResult:
+    """Visibility and optional two-head OCR output for one crop."""
+
     visibility_p: float
-    ocr_logits_tens: Optional[List[float]] = None
-    ocr_logits_units: Optional[List[float]] = None
+    ocr_logits_tens: list[float] | None = None
+    ocr_logits_units: list[float] | None = None
 
 
-def _crop_bgr(frame: np.ndarray, bbox: Tuple[float, float, float, float]) -> Optional[np.ndarray]:
-    h, w = frame.shape[:2]
+def _crop_bgr(
+    frame: np.ndarray,
+    bbox: tuple[float, float, float, float],
+) -> np.ndarray | None:
+    height, width = frame.shape[:2]
     x1, y1, x2, y2 = bbox
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    x2 = min(w, int(x2))
-    y2 = min(h, int(y2))
-    if x2 - x1 < 6 or y2 - y1 < 12:
+    left = max(0, int(x1))
+    top = max(0, int(y1))
+    right = min(width, int(x2))
+    bottom = min(height, int(y2))
+    if right - left < 6 or bottom - top < 12:
         return None
-    return frame[y1:y2, x1:x2, :]
+    return frame[top:bottom, left:right]
 
 
-def _to_chw_float(crop_bgr: np.ndarray, size: int) -> np.ndarray:
-    """BGR uint8 HxWx3 -> NCHW float32 with ImageNet norm at given size."""
-    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
-    arr = rgb.astype(np.float32) / 255.0
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-    arr = arr.transpose(2, 0, 1)
-    return arr
+def _preprocess(crop_bgr: np.ndarray, size: int) -> np.ndarray:
+    """Convert a BGR crop to an ImageNet-normalized CHW tensor."""
+    image = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR)
+    tensor = image.astype(np.float32) / 255.0
+    tensor = (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
+    return tensor.transpose(2, 0, 1)
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+def _make_batch(crops_bgr: Sequence[np.ndarray], size: int) -> np.ndarray:
+    return np.stack([_preprocess(crop, size) for crop in crops_bgr])
 
 
-def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    x = x - x.max(axis=axis, keepdims=True)
-    e = np.exp(x)
-    return e / e.sum(axis=axis, keepdims=True)
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -30.0, 30.0)))
+
+
+def _softmax(values: np.ndarray, axis: int = -1) -> np.ndarray:
+    shifted = values - values.max(axis=axis, keepdims=True)
+    exponentials = np.exp(shifted)
+    return exponentials / exponentials.sum(axis=axis, keepdims=True)
 
 
 class JerseyRecognizer:
-    """Singleton-friendly: holds two ONNX sessions on GPU."""
+    """Run the visibility gate, OCR, and temporal vote aggregation."""
 
-    def __init__(self):
+    def __init__(self, vote_config: JerseyVoteConfig | None = None) -> None:
         import onnxruntime as ort
 
-        gate_path = ensure_model("visibility_gate")
-        ocr_path = ensure_model("jersey_ocr")
+        settings = get_settings()
+        gate_path = ensure_model(
+            "visibility_gate",
+            auto_download=settings.model_auto_download,
+        )
+        ocr_path = ensure_model(
+            "jersey_ocr",
+            auto_download=settings.model_auto_download,
+        )
 
         providers = get_providers(prefer_gpu=True)
-        sess_opts = ort.SessionOptions()
-        sess_opts.log_severity_level = 3
-        self.gate_sess = ort.InferenceSession(str(gate_path), sess_opts, providers=providers)
-        self.ocr_sess = ort.InferenceSession(str(ocr_path), sess_opts, providers=providers)
-        self.gate_in_name = self.gate_sess.get_inputs()[0].name
-        self.ocr_in_name = self.ocr_sess.get_inputs()[0].name
-        self.ocr_out_names = [o.name for o in self.ocr_sess.get_outputs()]
-        logger.info(
-            f"jersey: gate={gate_path.name} ocr={ocr_path.name} "
-            f"providers={self.gate_sess.get_providers()}"
+        session_options = ort.SessionOptions()
+        session_options.log_severity_level = 3
+        self._gate_session = ort.InferenceSession(
+            str(gate_path),
+            sess_options=session_options,
+            providers=providers,
+        )
+        self._ocr_session = ort.InferenceSession(
+            str(ocr_path),
+            sess_options=session_options,
+            providers=providers,
         )
 
-    # ------------------------------------------------------------------ inference
+        gate_inputs = self._gate_session.get_inputs()
+        gate_outputs = self._gate_session.get_outputs()
+        if len(gate_inputs) != 1 or len(gate_outputs) != 1:
+            raise ValueError("visibility gate ONNX must expose one input and one output")
 
-    def process_crop(
+        ocr_inputs = self._ocr_session.get_inputs()
+        ocr_outputs = self._ocr_session.get_outputs()
+        if len(ocr_inputs) != 1 or len(ocr_outputs) != 2:
+            raise ValueError("jersey OCR ONNX must expose one input and two outputs")
+
+        self._gate_input_name = gate_inputs[0].name
+        self._ocr_input_name = ocr_inputs[0].name
+        self._ocr_output_names = [output.name for output in ocr_outputs]
+        self.vote_config = vote_config or JerseyVoteConfig()
+        logger.info(
+            "Jersey models loaded: gate=%s ocr=%s providers=%s",
+            gate_path.name,
+            ocr_path.name,
+            self._gate_session.get_providers(),
+        )
+
+    def process_boxes(
         self,
         frame: np.ndarray,
-        bbox: Tuple[float, float, float, float],
-    ) -> JerseyResult:
-        crop = _crop_bgr(frame, bbox)
-        if crop is None:
-            return JerseyResult(visibility_p=0.0)
+        boxes: Sequence[tuple[float, float, float, float]],
+    ) -> list[JerseyResult]:
+        """Recognize a batch with at most one gate and one OCR call."""
+        results = [JerseyResult(visibility_p=0.0) for _ in boxes]
+        crops: list[np.ndarray] = []
+        result_indices: list[int] = []
+        for result_index, box in enumerate(boxes):
+            crop = _crop_bgr(frame, box)
+            if crop is not None:
+                crops.append(crop)
+                result_indices.append(result_index)
+        if not crops:
+            return results
 
-        gate_inp = _to_chw_float(crop, 128)[None, ...]
-        gate_out = self.gate_sess.run(None, {self.gate_in_name: gate_inp})[0]
-        # output is (B,) logit
-        if gate_out.ndim == 0:
-            gate_logit = float(gate_out)
-        elif gate_out.ndim == 1:
-            gate_logit = float(gate_out[0])
-        else:
-            gate_logit = float(gate_out.reshape(-1)[0])
-        p_vis = float(_sigmoid(np.array(gate_logit)))
+        gate_input = _make_batch(crops, _GATE_IMAGE_SIZE)
+        gate_output = self._gate_session.run(
+            None,
+            {self._gate_input_name: gate_input},
+        )[0]
+        gate_logits = np.asarray(gate_output, dtype=np.float32)
+        if gate_logits.size != len(crops):
+            raise ValueError(
+                "visibility gate output must contain one logit per crop, "
+                f"got shape {gate_logits.shape} for batch {len(crops)}"
+            )
 
-        if p_vis < VIS_THRESHOLD:
-            return JerseyResult(visibility_p=p_vis)
+        visibility = _sigmoid(gate_logits.reshape(-1))
+        visible_crop_indices: list[int] = []
+        for crop_index, result_index in enumerate(result_indices):
+            probability = float(visibility[crop_index])
+            results[result_index].visibility_p = probability
+            if probability >= self.vote_config.visibility_threshold:
+                visible_crop_indices.append(crop_index)
 
-        ocr_inp = _to_chw_float(crop, 224)[None, ...]
-        outs = self.ocr_sess.run(self.ocr_out_names, {self.ocr_in_name: ocr_inp})
-        # outs[0]: (B, 10) tens, outs[1]: (B, 10) units
-        logits_tens = outs[0][0].astype(np.float32).tolist()
-        logits_units = outs[1][0].astype(np.float32).tolist()
-        return JerseyResult(
-            visibility_p=p_vis,
-            ocr_logits_tens=logits_tens,
-            ocr_logits_units=logits_units,
+        if not visible_crop_indices:
+            return results
+
+        ocr_input = _make_batch(
+            [crops[index] for index in visible_crop_indices],
+            _OCR_IMAGE_SIZE,
         )
+        ocr_outputs = self._ocr_session.run(
+            self._ocr_output_names,
+            {self._ocr_input_name: ocr_input},
+        )
+        tens = np.asarray(ocr_outputs[0], dtype=np.float32)
+        units = np.asarray(ocr_outputs[1], dtype=np.float32)
+        expected_shape = (len(visible_crop_indices), _DIGIT_CLASSES)
+        if tens.shape != expected_shape or units.shape != expected_shape:
+            raise ValueError(
+                "jersey OCR outputs must both have shape "
+                f"{expected_shape}, got {tens.shape} and {units.shape}"
+            )
 
-    # ------------------------------------------------------------- aggregation
+        for output_index, crop_index in enumerate(visible_crop_indices):
+            result = results[result_indices[crop_index]]
+            result.ocr_logits_tens = tens[output_index].tolist()
+            result.ocr_logits_units = units[output_index].tolist()
+        return results
 
-    @staticmethod
-    def _commit_from_votes(
-        votes: Dict[int, float],
-        counts: Dict[int, int],
-    ) -> Tuple[Optional[int], Optional[float], str]:
-        """Decide a number from pooled weighted votes.
-
-        Returns ``(number, confidence, status)``. ``status`` is "ok" or a
-        rejection reason for diagnostics.
-        """
-        if not votes:
+    def _commit_from_logits(
+        self,
+        logits_tens: list[float] | None,
+        logits_units: list[float] | None,
+        vote_count: int,
+    ) -> tuple[int | None, float | None, str]:
+        """Decode pooled OCR logits or return a rejection reason."""
+        if logits_tens is None or logits_units is None:
             return None, None, "no_votes"
-        ranked = sorted(votes.items(), key=lambda kv: -kv[1])
-        top_num, top_w = ranked[0]
-        runner_w = ranked[1][1] if len(ranked) > 1 else 0.0
-        total_w = sum(votes.values())
-        agg_conf = top_w / total_w if total_w > 0 else 0.0
-        margin = top_w / runner_w if runner_w > 0 else float("inf")
-        n_votes_top = counts.get(top_num, 0)
-
-        if n_votes_top < MIN_VOTES_FOR_NUMBER:
+        if vote_count < self.vote_config.min_votes:
             return None, None, "too_few"
-        if top_w < MIN_TOP_WEIGHT:
-            return None, None, "weak"
-        if runner_w > 0 and margin < MARGIN_RATIO:
-            return None, None, "low_margin"
-        if agg_conf < MIN_CONFIDENCE_FOR_NUMBER:
-            return None, None, "low_conf"
-        return top_num, agg_conf, "ok"
+
+        tens_sum = np.asarray(logits_tens, dtype=np.float32)
+        units_sum = np.asarray(logits_units, dtype=np.float32)
+        tens_digit = int(np.argmax(tens_sum))
+        units_digit = int(np.argmax(units_sum))
+        number = units_digit if tens_digit == 0 else tens_digit * 10 + units_digit
+        tens_probability = _softmax(tens_sum / vote_count)[tens_digit]
+        units_probability = _softmax(units_sum / vote_count)[units_digit]
+        confidence = float(min(tens_probability, units_probability))
+        return number, confidence, "ok"
 
     def collect_votes_into_tracks(self, state: ClipState) -> None:
-        """Pass A (per raw fragment, before track-merge): tally weighted OCR
-        votes per number and store them on the track. The committed number
-        here is provisional (a merge hint); the authoritative one comes from
-        :meth:`commit_numbers` on the pooled votes of the merged identity."""
-        by_track = state.observations_by_track()
-        total_obs = 0
-        n_passed_vis = 0
-        n_passed_conf = 0
+        """Accumulate accepted OCR logits on each raw player fragment."""
+        observations_by_track = state.observations_by_track()
+        total_observations = 0
+        visible_observations = 0
+        accepted_observations = 0
 
-        for tid, obs_list in by_track.items():
-            if tid not in state.tracks:
-                continue
-            track = state.tracks[tid]
-            if track.cls_id not in (0, 1):
+        for track_id, observations in observations_by_track.items():
+            track = state.tracks.get(track_id)
+            if track is None or track.cls_id != 0:
                 continue
 
-            votes: Dict[int, float] = {}
-            counts: Dict[int, int] = {}
-            for o in obs_list:
-                total_obs += 1
+            tens_sum = np.zeros(_DIGIT_CLASSES, dtype=np.float32)
+            units_sum = np.zeros(_DIGIT_CLASSES, dtype=np.float32)
+            visible_count = 0
+            vote_count = 0
+            for observation in observations:
+                total_observations += 1
                 if (
-                    o.visibility_p is None
-                    or o.visibility_p < VIS_THRESHOLD
-                    or o.ocr_logits_tens is None
-                    or o.ocr_logits_units is None
+                    observation.visibility_p is None
+                    or observation.visibility_p < self.vote_config.visibility_threshold
+                    or observation.ocr_logits_tens is None
+                    or observation.ocr_logits_units is None
                 ):
                     continue
-                n_passed_vis += 1
-                prob_tens = _softmax(np.asarray(o.ocr_logits_tens, dtype=np.float32))
-                prob_units = _softmax(np.asarray(o.ocr_logits_units, dtype=np.float32))
-                tens = int(np.argmax(prob_tens))
-                units = int(np.argmax(prob_units))
-                c_f = float(prob_tens[tens] * prob_units[units])
-                if c_f < MIN_PER_FRAME_OCR_CONF:
-                    continue
-                n_passed_conf += 1
-                num = units if tens == 0 else tens * 10 + units
-                votes[num] = votes.get(num, 0.0) + float(o.visibility_p) * c_f
-                counts[num] = counts.get(num, 0) + 1
 
-            track.jersey_votes = votes
-            track.jersey_vote_counts = counts
-            num, conf, _ = JerseyRecognizer._commit_from_votes(votes, counts)
-            track.jersey_number = num
-            track.jersey_confidence = conf
+                visible_observations += 1
+                visible_count += 1
+                tens_logits = np.asarray(observation.ocr_logits_tens, dtype=np.float32)
+                units_logits = np.asarray(observation.ocr_logits_units, dtype=np.float32)
+                tens_probabilities = _softmax(tens_logits)
+                units_probabilities = _softmax(units_logits)
+                tens_digit = int(np.argmax(tens_probabilities))
+                units_digit = int(np.argmax(units_probabilities))
+                digit_confidence = float(
+                    min(tens_probabilities[tens_digit], units_probabilities[units_digit])
+                )
+                if digit_confidence < self.vote_config.min_digit_confidence:
+                    continue
+
+                accepted_observations += 1
+                tens_sum += tens_logits
+                units_sum += units_logits
+                vote_count += 1
+
+            track.jersey_logits_tens = tens_sum.tolist() if vote_count else None
+            track.jersey_logits_units = units_sum.tolist() if vote_count else None
+            track.jersey_vote_count = vote_count
+            track.n_frames_visible_gate = visible_count
+            number, confidence, _ = self._commit_from_logits(
+                track.jersey_logits_tens,
+                track.jersey_logits_units,
+                vote_count,
+            )
+            track.jersey_number = number
+            track.jersey_confidence = confidence
 
         logger.info(
-            f"jersey votes collected: obs={total_obs} vis_pass={n_passed_vis} "
-            f"ocr_conf_pass={n_passed_conf} over {len(by_track)} fragments"
+            "Jersey votes collected: observations=%d visible=%d accepted=%d fragments=%d",
+            total_observations,
+            visible_observations,
+            accepted_observations,
+            len(observations_by_track),
         )
 
     def commit_numbers(self, state: ClipState) -> None:
-        """Pass B (per merged identity, after track-merge): recompute numbers
-        from pooled votes. No dedup here — numbers are only unique within a
-        team, so that waits for team assignment (:meth:`dedup_numbers`)."""
-        n_ok = 0
-        reasons: Dict[str, int] = {}
-        for t in state.tracks.values():
-            if t.cls_id not in (0, 1):
+        """Decode pooled evidence after fragment merging."""
+        committed = 0
+        reasons: dict[str, int] = {}
+        for track in state.tracks.values():
+            if track.cls_id != 0:
                 continue
-            votes = t.jersey_votes or {}
-            counts = t.jersey_vote_counts or {}
-            num, conf, status = JerseyRecognizer._commit_from_votes(votes, counts)
+            number, confidence, status = self._commit_from_logits(
+                track.jersey_logits_tens,
+                track.jersey_logits_units,
+                track.jersey_vote_count,
+            )
             reasons[status] = reasons.get(status, 0) + 1
-            t.jersey_number = num
-            t.jersey_confidence = conf
-            if num is not None:
-                n_ok += 1
+            track.jersey_number = number
+            track.jersey_confidence = confidence
+            if number is not None:
+                committed += 1
 
         logger.info(
-            f"jersey commit: {n_ok}/{len(state.tracks)} tracks got numbers "
-            f"(reasons={reasons})"
+            "Jersey numbers committed: committed=%d tracks=%d reasons=%s",
+            committed,
+            len(state.tracks),
+            reasons,
         )
 
     def dedup_numbers(self, state: ClipState) -> None:
-        """Pass C (after team assignment): within each (team, number) group
-        keep the track with the most accumulated vote weight — a long,
-        well-observed track beats a short over-confident fragment. Different
-        teams may legitimately share a number."""
-        def _team_key(t) -> object:
-            if t.team_id is not None:
-                return t.team_id
-            return t.team_label or "unknown"
-
-        by_team_number: Dict[Tuple[object, int], List[int]] = {}
-        for tid, t in state.tracks.items():
-            if t.jersey_number is None:
+        """Keep one claim for each team and jersey number."""
+        by_team_number: dict[tuple[int, int], list[int]] = {}
+        for track_id, track in state.tracks.items():
+            if track.jersey_number is None or track.team_id is None:
                 continue
-            key = (_team_key(t), t.jersey_number)
-            by_team_number.setdefault(key, []).append(tid)
+            key = (track.team_id, track.jersey_number)
+            by_team_number.setdefault(key, []).append(track_id)
 
-        def _evidence(tid: int) -> float:
-            t = state.tracks[tid]
-            return (t.jersey_votes or {}).get(t.jersey_number, 0.0)
+        def evidence(track_id: int) -> float:
+            track = state.tracks[track_id]
+            return float(track.jersey_vote_count) * float(track.jersey_confidence or 0.0)
 
-        n_dedup = 0
-        for (team, num), tids in by_team_number.items():
-            if len(tids) <= 1:
+        dropped = 0
+        for (team_id, number), track_ids in by_team_number.items():
+            if len(track_ids) <= 1:
                 continue
-            tids_sorted = sorted(tids, key=lambda x: -_evidence(x))
-            keeper = tids_sorted[0]
-            keeper_ev = _evidence(keeper)
-            for loser in tids_sorted[1:]:
-                lt = state.tracks[loser]
+            ranked_track_ids = sorted(track_ids, key=evidence, reverse=True)
+            keeper_id = ranked_track_ids[0]
+            keeper_evidence = evidence(keeper_id)
+            for duplicate_id in ranked_track_ids[1:]:
+                duplicate = state.tracks[duplicate_id]
                 logger.debug(
-                    f"  dedup drop tid={loser} J{num} team={team} "
-                    f"ev={_evidence(loser):.1f} "
-                    f"(kept tid={keeper} ev={keeper_ev:.1f})"
+                    "Dropping duplicate jersey claim: track=%d jersey=%d team=%d "
+                    "evidence=%.1f keeper=%d keeper_evidence=%.1f",
+                    duplicate_id,
+                    number,
+                    team_id,
+                    evidence(duplicate_id),
+                    keeper_id,
+                    keeper_evidence,
                 )
-                lt.jersey_number = None
-                lt.jersey_confidence = None
-                n_dedup += 1
+                duplicate.jersey_number = None
+                duplicate.jersey_confidence = None
+                dropped += 1
 
-        if n_dedup:
-            logger.info(f"jersey dedup: dropped {n_dedup} duplicate (team, number) claims")
+        if dropped:
+            logger.info("Duplicate jersey claims dropped: count=%d", dropped)
 
 
-_INSTANCE: Optional[JerseyRecognizer] = None
+_INSTANCE: JerseyRecognizer | None = None
 
 
 def get_jersey_recognizer() -> JerseyRecognizer:

@@ -1,369 +1,252 @@
-# soccerGSR: Game State Reconstruction in Soccer
+# soccerGSR
 
-Reconstructing the game state of a football match
+Offline game-state reconstruction for soccer broadcast clips. You upload a
+clip, the service runs it through a GPU inference pipeline and returns an
+annotated MP4 (boxes, jersey numbers, a top-down minimap) and a per-frame JSON
+with every player's identity, team, and position in pitch coordinates.
 
-![Status](https://img.shields.io/badge/status-completed-brightgreen)
-![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
-![Framework](https://img.shields.io/badge/framework-PyTorch-orange)
-![Service](https://img.shields.io/badge/service-FastAPI-009688)
+One machine, one GPU, one job at a time. The API is a thin FastAPI layer over
+a local queue: no authentication, no multi-tenancy, loopback only. It is meant
+for a trusted local machine.
 
-A team project by 1st-year Master's students of the "Artificial Intelligence" program at HSE University (Faculty of Computer Science). The goal of the project is to build a system for analyzing football broadcasts using computer vision.
+The research pipeline this service was distilled from scored 55.68 GS-HOTA on
+the SoccerNetGS public test split. The service has not yet reproduced that
+number in a fresh video-to-score run; the exact boundary is documented in
+[docs/benchmark.md](docs/benchmark.md).
 
----
+## How it works
 
-## Project Goal
+A clip is processed in two passes, so identity decisions can use evidence from
+the whole clip instead of being made frame by frame.
 
-The main goal of the project is to design and ship an end-to-end system that takes a clip of a football match as input and performs **player detection and tracking** on it. The final solution is packaged as an interactive web service for a clear demonstration of the models.
+Pass 1 walks the video once and collects raw evidence:
 
----
+- DEIMv2 (a DETR-family detector) finds players, goalkeepers, referees, and
+  the ball;
+- BoT-SORT links detections into track fragments; people and the ball get two
+  independent tracker states, so an id can never migrate between a boot and
+  the ball;
+- OSNet computes a 512-d appearance embedding for every person crop;
+- a ShuffleNetV2 gate decides whether the jersey number is readable, and a
+  two-head ConvNeXt OCR votes on the digits when it is;
+- two PnLCalib HRNets detect pitch keypoints and line points.
 
-## ML Service (FastAPI, async, GSR)
+Aggregate consolidates the whole clip in memory:
 
-End-to-end Game State Reconstruction for football broadcasts. Every ML stage runs on GPU via `onnxruntime-gpu`. One GPU — one worker at a time.
+- an image-to-pitch homography is fitted per frame from the HRNet evidence;
+  degenerate and jumping fits are rejected, short gaps are interpolated, long
+  gaps are held a few frames from each side and honestly left uncalibrated in
+  the middle, and the accepted sequence is smoothed with a Savitzky-Golay
+  filter. Every frame records how its homography was obtained (`h_source`:
+  `solved` / `held` / `interp` / `none`);
+- per-track OSNet means are clustered into two teams (k-means) and the
+  anonymous clusters are oriented by pitch position;
+- fragments are merged into identities by three rules, in order: same team
+  plus a confidently read jersey number, physically feasible pitch motion, and
+  OSNet cosine similarity of at least `0.90`. Guards keep two different known
+  numbers out of one identity and refuse any merge that implies impossible
+  movement;
+- jersey numbers are committed from pooled OCR votes, teleporting ball points
+  are dropped, player trajectories get a median filter plus Savitzky-Golay,
+  and short detection gaps are interpolated.
 
-### Full per-clip pipeline
+Pass 2 walks the video again and renders the result: boxes with ids and
+numbers, the minimap (frozen, then blanked, when calibration is missing), and
+`gsr.json` with everything the pipeline knows.
 
-| Stage     | What it does                                                                                                                                                                                                                              | Model                                                                                                                               |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Pass1     | per-frame: detection → DINOv3 batch-embed → tracking (motion + ReID) → jersey gate+OCR → team embedding sample → field keypoints/lines                                                                                                   | YOLOv5lu, DINOv3 ViT-S+/16, BoT-SORT (vendored, motion+IoU+CMC+ReID), ShuffleNetV2 (visibility), ConvNeXt-Tiny (OCR), HRNet kp/lines |
-| Aggregate | per-track: jersey number from logits-mean, team via 2-component GMM on per-track mean DINOv3 embeddings (outfield outliers → referee), independent GK GMM; per-clip: PnLCalib homography per frame, foot-point projection to pitch coords | scikit-learn GaussianMixture, PnLCalib FramebyFrameCalib                                                                             |
-| Pass2     | render mp4: bbox + #track\_id + J + team color + pitch minimap with projections                                                                                                                                                          | OpenCV                                                                                                                               |
+Two similar-sounding thresholds are different quantities: BoT-SORT associates
+detections at a maximum cosine distance of `0.4`, offline merging requires a
+minimum cosine similarity of `0.90`.
 
-### REST API (async, primary)
+## Stack
 
-- **POST /forward** — accepts an mp4, returns `202 Accepted` + `job_id`. The worker processes it in the background.
-- **GET /jobs/{job_id}** — status (`queued|running|done|error`), stage (`pass1|aggregate|pass2`), progress %.
-- **GET /jobs/{job_id}/video** — the finished annotated mp4 (404 until done).
-- **GET /jobs/{job_id}/gsr.json** — the ClipState structure: `meta`, `frames` (homography per frame), `observations` (bbox + track_id + visibility_p + team_id + pitch_xy), `tracks` (cls_name, jersey_number, team_label, ...).
-- **GET /jobs?limit=&offset=&status=** — a list of recent jobs.
-- **POST /forward/sync** — legacy: internally enqueues an async job and blocks until it finishes. Compatible with the old API.
+- Service: FastAPI, Uvicorn, SQLAlchemy + aiosqlite (job state in SQLite),
+  pydantic-settings.
+- Inference: ONNX Runtime (CUDA) for all six models, OpenCV for video and
+  drawing, NumPy, SciPy (Savitzky-Golay and median filters), scikit-learn
+  (team k-means).
+- Vendored: trimmed runtime subsets of BoxMOT (BoT-SORT, AGPL-3.0) and
+  PnLCalib (calibration, GPL-2.0); see the NOTICE files under `app/vendor/`.
+- Tooling: uv with a locked Python 3.12 environment, pytest, ruff.
 
-### Additional endpoints
+## Requirements
 
-- **GET /history**, **DELETE /history** (admin JWT), **GET /stats**
-- JWT auth: `/auth/register`, `/auth/login`, `/auth/me`
-- Alembic migrations for `users`, `request_history`, `jobs`
+- Linux or WSL2, Python 3.12, `uv` 0.11.25+
+- NVIDIA GPU with a CUDA 12 driver. ONNX Runtime can fall back to CPU, but
+  the pipeline is sized for GPU (a 42 s clip takes about 7.5 minutes of GPU
+  time), so treat the CUDA check below as required.
+- FFmpeg for H.264 output; OpenCV MP4 is the fallback.
 
-### Contributors
-
-- **OlegNotHehe** (Oleg Rokin) — EDA, YOLOv5 / v5u / x6u baselines, implementation of the main inference script, field calibration
-- **PogChamper** (Oleg Baishev) — EDA, DEIMv2 (S/M/L, 640/896), Jersey OCR + Visibility Gate (VLM, ablation), ReID, traciking, team classification, the rest of the service work
-
----
-
-## Installation & Run
-
-### System requirements
-
-- Linux / WSL2 (tested on Ubuntu 24.04)
-- NVIDIA GPU + driver with CUDA 12.x compatibility (tested on RTX 4070 Ti SUPER 16GB)
-- Python 3.12 (3.11 also works)
-
-### 1. venv
-
-```
-python -m venv venv
-source venv/bin/activate
-```
-
-### 2. Dependencies
-
-```
-pip install --upgrade pip wheel setuptools
-pip install -r requirements.txt
-```
-
-`requirements.txt` pulls in onnxruntime-gpu 1.20.1 (CUDA 12), transformers 4.57
-(for offline DINOv3 export only), torch 2.5.1 + torchvision 0.20.1 (needed for
-the heatmap decode in PnLCalib and for the ONNX exports), scikit-learn
-(GMM/KMeans), shapely, lap, loguru. **boxmot is not installed** — instead, a
-trimmed, torch-free fork under `app/vendor/boxmot/` is used (see
-`app/vendor/boxmot/NOTICE.md`, AGPL-3.0 license).
-
-### 3. WSL2 nuance
-
-`app/utils/cuda_env.bootstrap()` itself adds `/usr/lib/wsl/lib` to
-`LD_LIBRARY_PATH` and calls `ort.preload_dlls(cuda=True, cudnn=True)` **before**
-the first session is created. Without this, `onnxruntime-gpu >= 1.19` fails with
-`CUDA failure 100`. The bootstrap is idempotent and is called from `lifespan`.
-
-### 4. DB migrations
-
-```
-alembic upgrade head
+```bash
+uv sync --locked --no-dev
+cp env.example .env
 ```
 
-### 5. Run
-
-```
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-On startup it automatically:
-
-1. Bootstraps CUDA for WSL.
-2. Through `app/utils/models_registry`, pulls all models from Google Drive
-(gdown) and verifies their sha256.
-3. Creates the ORT sessions **before** any `import torch` (important: torch
-initializes its own cudnn frontend, after which ORT can no longer create a new
-CUDA session on cudnn 9.1).
-4. Starts the background job-processing worker.
-
----
+The lock pins `onnxruntime-gpu` only: the CPU and GPU wheels share one Python
+namespace and must not coexist in the same environment.
 
 ## Models
 
-All DL models are **ONNX**. The registry and auto-download live in
-`app/utils/models_registry.py`: each model is downloaded from Google Drive
-(gdown) if missing and verified by sha256. The export scripts are only needed to
-re-export weights from the source checkpoints.
+Six ONNX artifacts, all verified by SHA-256:
 
-| Model                      | File                                 | Size        | Re-export                                                      |
-| -------------------------- | ------------------------------------ | ----------- | -------------------------------------------------------------- |
-| DEIMv2 detector (main)     | `models/deimv2_m_896.onnx`           | 76 MB       | DEIMv2 `export_l_model.py` from `best_stg2.pth`               |
-| YOLO detector (legacy)     | `models/best.onnx`                   | 213 MB      | —                                                              |
-| Visibility gate            | `models/visibility_gate.onnx`        | ~5 MB       | jersey-visibility-project (ShuffleNetV2)                       |
-| Jersey OCR                 | `models/jersey_ocr.onnx` (+ `.data`) | ~110+110 MB | jersey-ocr-project (ConvNeXt-Tiny)                            |
-| HRNet keypoints            | `models/hrnet_kp.onnx`               | 264 MB      | `python scripts/export_hrnet_onnx.py kp`                       |
-| HRNet lines                | `models/hrnet_lines.onnx`            | 264 MB      | `python scripts/export_hrnet_onnx.py lines`                    |
-| DINOv3 embedder            | `models/dinov3_vits16plus.onnx`      | 115 MB      | `python scripts/export_dinov3_onnx.py` (gated on HF, see below) |
+| Registry name | Model | Role |
+|---|---|---|
+| `deimv2_detector` | DEIMv2-DINOv3 M @ 896 | players, goalkeepers, referees, ball |
+| `visibility_gate` | ShuffleNetV2 | is the jersey number readable |
+| `jersey_ocr` | ConvNeXt-Tiny, two heads | jersey digits |
+| `hrnet_kp`, `hrnet_lines` | PnLCalib HRNet | pitch keypoints and lines |
+| `osnet_reid` | OSNet-x1.0 (SoccerNet) | re-id embeddings for teams and merging |
 
-### Export PnLCalib HRNet → ONNX
+Download everything that has a configured source:
 
-```
-python scripts/export_hrnet_onnx.py both
+```bash
+uv run --locked --no-dev python -m app.utils.models_registry
 ```
 
-The script does everything itself:
+OSNet has no public download source yet. Place the pre-exported file at
+`models/osnet_x1_0_soccernet.onnx`, or point the service at it with a process
+environment variable (not `.env`):
 
-1. Downloads `SV_kp` and `SV_lines` (~265 MB each) from
-`github.com/mguti97/PnLCalib/releases/v1.0.0`.
-2. Loads them through the vendored copy `app/vendor/pnlcalib/model/cls_hrnet*.py`.
-3. Exports with opset 17, fixed input `(1, 3, 540, 960)`, and `dynamic_axes`
-over batch.
-
-### Export DINOv3 → ONNX
-
-```
-python scripts/export_dinov3_onnx.py
+```bash
+export MODELS__OSNET_REID__PATH=/absolute/path/osnet_x1_0_soccernet.onnx
 ```
 
-Downloads `facebook/dinov3-vits16plus-pretrain-lvd1689m` (28.7M params,
-embedding 384, gated — you must accept the
-[DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/)
-and be logged in via `huggingface-cli login`), and exports only `pooler_output`
-through `torch.onnx.export`, opset 17, dynamic batch axis, input fixed at
-`(B, 3, 224, 224)`. The ONNX is ~110 MB; latency on an RTX 4070 Ti SUPER:
+Required SHA-256:
 
-- batch 1 → ~6 ms
-- batch 8 → ~10 ms (1.3 ms/img)
-- batch 22 → ~20 ms (~0.9 ms/img) — a typical frame (~22 players)
-
-In a single pass, the DINOv3 embedding feeds both consumers: BoT-SORT receives
-it via `update(..., embeddings=...)` for ReID-aware association, and the
-`TeamClassifier` uses it for GMM team clustering.
-
----
-
-## API Documentation
-
-Swagger: <http://localhost:8000/docs>
-
-### Async (recommended): POST /forward
-
-```
-# 1. submit
-JOB=$(curl -s -X POST "http://localhost:8000/forward" \
-  -F "image=@123.mp4" | jq -r '.job_id')
-
-# 2. poll
-watch -n 1 "curl -s http://localhost:8000/jobs/$JOB | jq"
-
-# 3. download
-curl -s "http://localhost:8000/jobs/$JOB/video"     -o gsr.mp4
-curl -s "http://localhost:8000/jobs/$JOB/gsr.json"  -o gsr.json
+```text
+6d7a70bb28c309d91f970dbff190755a95bfed78089aa6a9831b1824914cb078
 ```
 
-`gsr.json` contains:
+Then verify the full set. Startup is fail-fast: all six models are required,
+there is no reduced-quality mode.
 
-```
-{
-  "meta": {"filename":"...","width":1920,"height":1080,"fps":30,"frame_count":673,...},
-  "frames": [{"frame_idx":0,"H_world2img":[[...]],"H_img2world":[[...]],"cam_params":{...}}, ...],
-  "observations": [
-    {"frame_idx":0,"track_id":2,"cls_id":0,"bbox_xyxy":[...],"team_id":1,"pitch_xy":[12.3,4.5], ...},
-    ...
-  ],
-  "tracks": {
-    "2": {"track_id":2,"cls_name":"player","team_label":"team_b","jersey_number":10,"jersey_confidence":0.99, ...},
-    ...
-  }
-}
+```bash
+uv run --locked --no-dev python -m app.utils.models_registry --strict
 ```
 
-### Legacy sync: POST /forward/sync
+## Run
 
-Compatible with the old API: blocks until completion and returns either a
-base64 mp4 (JSON) or a stream:
-
-```
-curl -X POST "http://localhost:8000/forward/sync" \
-  -F "image=@video.mp4" \
-  -H "X-Return-Format: stream" -o output.mp4
+```bash
+uv run --locked --no-dev python -m app.utils.cuda_env
+uv run --locked --no-dev uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-### Misc
+The first command must report `CUDAExecutionProvider`. Use exactly one worker:
+the queue, job ownership, and loaded GPU sessions are process-local. Readiness
+turns green only after the database, the models, and the job worker are up:
 
-```
-curl "http://localhost:8000/jobs?limit=10&status=done"
-curl "http://localhost:8000/history?limit=10&offset=0"
-curl -X DELETE "http://localhost:8000/history" -H "Authorization: Bearer <admin-jwt>"
-curl "http://localhost:8000/stats"
-curl "http://localhost:8000/health"
-```
-
----
-
-## Authentication
-
-### Registration
-
-```
-curl -X POST "http://localhost:8000/auth/register" \
-  -H "Content-Type: application/json" \
-  -d '{"username": "user1", "password": "password123"}'
+```bash
+curl -fsS http://127.0.0.1:8000/health/live
+curl -fsS http://127.0.0.1:8000/health/ready
 ```
 
-### Login
+OpenAPI docs: `http://127.0.0.1:8000/docs`.
 
-```
-curl -X POST "http://localhost:8000/auth/login" \
-  -d "username=user1&password=password123"
-```
+## API
 
-### Creating an admin
+Submit a clip and poll until `status` is `done` (on `error`, read
+`error_message`):
 
-Registration via the API never grants admin rights. To create a user or promote
-one to admin (needed for `DELETE /history`):
-
-```
-PYTHONPATH=. python scripts/create_admin.py admin <password>
+```bash
+JOB_ID=$(curl -fsS -X POST http://127.0.0.1:8000/jobs \
+  -F video=@clip.mp4 | python -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')
+watch -n 5 "curl -fsS http://127.0.0.1:8000/jobs/$JOB_ID | python -m json.tool"
 ```
 
----
+Download the outputs, list jobs, delete a finished job and its artifacts:
 
-## Detection classes
-
-| ID | Class      | Color       |
-| --- | ---------- | ----------- |
-| 0  | player     | 🟢 Green     |
-| 1  | goalkeeper | 🟡 Yellow    |
-| 2  | referee    | 🔴 Red       |
-| 3  | ball       | 🟠 Orange    |
-
----
-
-## Project structure
-
-```
-soccer-app/
-├── app/
-│   ├── main.py                          # FastAPI lifespan: cuda → models → ORT → torch → worker
-│   ├── config.py
-│   ├── api/
-│   │   ├── jobs.py                      # POST /forward (async), GET /jobs/{id}/...
-│   │   ├── forward.py                   # POST /forward/sync (legacy wrapper)
-│   │   ├── history.py
-│   │   ├── stats.py
-│   │   └── auth.py
-│   ├── models/
-│   │   ├── database.py                  # users, request_history, jobs
-│   │   └── schemas.py
-│   ├── services/
-│   │   ├── detector.py                  # YOLO ONNX
-│   │   ├── tracker.py                   # wrapper over app/vendor/boxmot (BoT-SORT, no torch)
-│   │   ├── jersey.py                    # visibility gate ONNX + ConvNeXt OCR ONNX + per-track aggregation
-│   │   ├── embedder.py                  # DINOv3 ViT-S+/16 ONNX (shared ReID + team)
-│   │   ├── team_classifier.py           # GMM on DINO embeddings + outlier→referee
-│   │   ├── keypoints.py                 # PnLCalib HRNet kp+lines via ORT
-│   │   ├── calibration.py               # FramebyFrameCalib wrapper, projection, foot-point → pitch
-│   │   ├── minimap.py                   # 2D pitch + player markers overlay
-│   │   ├── clip_state.py                # ClipMeta / FrameInfo / FrameObservation / TrackInfo / ClipState
-│   │   ├── video_processor.py           # pass1 + aggregate + pass2 orchestrator
-│   │   ├── job_worker.py                # asyncio queue + thread executor for GPU jobs
-│   │   └── history_service.py
-│   ├── utils/
-│   │   ├── cuda_env.py                  # WSL2 LD_LIBRARY_PATH + ort.preload_dlls bootstrap
-│   │   ├── models_registry.py           # central model spec/download registry (Google Drive + sha256)
-│   │   └── visualizer.py                # bbox + track + jersey + team color
-│   └── vendor/
-│       └── pnlcalib/                    # vendored from github.com/mguti97/PnLCalib (model + utils + config)
-├── scripts/
-│   └── export_hrnet_onnx.py             # SV_kp/SV_lines .pt → ONNX 540×960
-├── models/
-│   ├── best.onnx                        # YOLO detector
-│   ├── visibility_gate.onnx             # ShuffleNetV2
-│   ├── jersey_ocr.onnx (+ .data)        # ConvNeXt-Tiny tens+units
-│   ├── hrnet_kp.onnx                    # PnLCalib SV_kp
-│   ├── hrnet_lines.onnx                 # PnLCalib SV_lines
-│   └── SV_*.pt                          # source weights kept for re-export
-├── alembic/
-│   ├── env.py
-│   └── versions/
-│       ├── 2024_..._001_initial_migration.py
-│       └── 2026_..._002_add_jobs_table.py
-├── alembic.ini
-├── requirements.txt
-└── README.md
+```bash
+curl -f "http://127.0.0.1:8000/jobs/$JOB_ID/video" -o annotated.mp4
+curl -f "http://127.0.0.1:8000/jobs/$JOB_ID/gsr.json" -o gsr.json
+curl -fsS "http://127.0.0.1:8000/jobs?status=done&limit=20"
+curl -X DELETE "http://127.0.0.1:8000/jobs/$JOB_ID"
 ```
 
----
+Behavior worth knowing:
 
-## Tech stack
+- uploads stream to disk and are capped by `MAX_VIDEO_SIZE_MB`; the bounded
+  queue answers `503` with `Retry-After` when full;
+- input files are removed after processing; outputs stay until the job is
+  deleted (no TTL, no disk quota);
+- on restart, complete artifact pairs are finalized and interrupted jobs with
+  an intact input are requeued;
+- graceful shutdown waits for the active job, because a running inference
+  thread cannot be cancelled safely.
 
-- **Language:** Python 3.12 (3.11 ok)
-- **Inference:** onnxruntime-gpu 1.20 (CUDA 12, cudnn 9). `torch 2.5.1` stays as a dependency only for the heatmap decode inside PnLCalib and for the offline ONNX export; torch is not loaded on the tracker's inference path.
-- **Computer Vision:** OpenCV (headless), NumPy
-- **ML models:**
-  * YOLOv5lu — detection (player / goalkeeper / referee / ball)
-  * BoT-SORT (vendored, app/vendor/boxmot, AGPL-3.0; numpy + scipy + opencv) — motion + appearance tracking, with embeddings from DINOv3
-  * DINOv3 ViT-S+/16 — shared appearance embedder for ReID and team clustering
-  * ShuffleNetV2 — visibility gate (jersey-visibility-project)
-  * ConvNeXt-Tiny two-head — jersey OCR (jersey-ocr-project)
-  * HRNet-W48 (×2) — field keypoints + lines (PnLCalib SV_kp / SV_lines)
-- **Calibration:** PnLCalib FramebyFrameCalib (per-frame, classical solver)
-- **Team clustering:** scikit-learn `GaussianMixture` (k=2 outfield, k=2 GK separately) on 384-d L2-normalized DINOv3 embeddings; outfield tracks with a log-likelihood below the 5th percentile are auto-promoted to `referee`.
-- **Service:** FastAPI + Uvicorn, async job worker (1 GPU = 1 worker)
-- **DB:** SQLite + SQLAlchemy 2 + Alembic
+In `gsr.json`, `cls_id` is the consolidated role and `raw_cls_id` the
+detector's original one; interpolated observations carry `"synthetic": true`;
+each frame's `h_source` says where its homography came from.
 
----
+## Configuration
 
-## Licenses & attribution
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL_AUTO_DOWNLOAD` | `true` | download missing artifacts that have a source |
+| `DEIMV2_CONFIDENCE_THRESHOLD` | `0.4` | detector confidence threshold |
+| `DATABASE_URL` | `<project>/soccer_gsr.db` | SQLite job database |
+| `ARTIFACT_DIR` | `<project>/soccer_gsr_jobs` | inputs and outputs |
+| `MAX_VIDEO_SIZE_MB` | `100` | upload size limit |
+| `MAX_PENDING_JOBS` | `4` | pending jobs, excluding the active one |
+| `DEBUG` | `false` | SQL logging and debug mode |
 
-- **BoT-SORT** — tracking is built on the [BoxMOT](https://github.com/mikel-brostrom/boxmot) code (Mikel Broström, **AGPL-3.0**). `app/vendor/boxmot/` holds a trimmed, torch-free fork (BoT-SORT only, no ReID backbones); the full list of changes and the license text are in `app/vendor/boxmot/NOTICE.md` and `app/vendor/boxmot/LICENSE-AGPL`.
-- **PnLCalib** — camera calibration is based on [mguti97/PnLCalib](https://github.com/mguti97/PnLCalib) (**GPL-2.0**); `app/vendor/pnlcalib/` vendors the HRNet definitions, the heatmap decoder, and the calibration optimization. The `SV_kp`/`SV_lines` weights are from the PnLCalib releases.
-- **DINOv3** — the embedder uses the [facebook/dinov3-vits16plus-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m) weights under the [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/) (Meta).
+## Benchmark evaluation
 
----
+Convert a service result into SoccerNetGS prediction format:
 
-## One-year work plan
+```python
+from benchmark.predictions import export_prediction
 
-| Checkpoint                   | Deadline                                  | Stage goal                          | Key tasks                                                                                                                       |
-| ---------------------------- | ----------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **1. Setup**                 | End of September 2025                      | Formalize the project               | - Create the repository   - Finalize the topic and plan   - Write `README.md`                                                  |
-| **2. EDA**                   | Late October 2025                         | Explore the data                    | - Find and analyze datasets (SoccerNet, SportsMOT)   - Write EDA scripts   - Pick the main dataset to work with                |
-| **3-4. Baseline**            | End of November 2025 – mid-January 2026   | Build the first working prototype   | - Train a baseline detector (YOLOv8)   - Implement a simple tracker (Kalman Filter)   - Assemble the `Detection + Tracking` pipeline |
-| **5. Service**               | Mid-February 2026                         | Package the solution into a demo    | - Build a UI in Streamlit/Gradio   - Integrate the baseline models into the web service   - Demo on test videos                |
-| **6-7. Improving the DL part** | End of March – mid-May 2026             | Improve tracking quality            | - Study and integrate a SOTA tracker (BoT-SORT)   - Train/adapt a Re-ID model   - Compare metrics against the baseline         |
-| **Defense**                  | June 2026                                 | Finalize and present the project    | - Prepare the final report   - Build the presentation   - Demo the best version of the service                                 |
+export_prediction(
+    state_path="artifacts/SNGS-116/gsr.json",
+    labels_path="/data/SoccerNetGS/test/SNGS-116/Labels-GameState.json",
+    output_path="predictions/SoccerNetGS-test/service/data/SNGS-116.json",
+)
+```
 
----
+Then run the evaluator (it needs `sn-trackeval`, which is not part of the
+runtime environment):
 
-## Team
+```bash
+uv run --no-project --isolated --python 3.12 --with sn-trackeval==0.4.0 \
+  python -m benchmark.evaluate \
+  --gt-root /data/SoccerNetGS \
+  --trackers-root predictions \
+  --split test \
+  --tag service \
+  --sequences all \
+  --output metrics-test.json
+```
 
-- **PogChamper** (Oleg Baishev) — Researcher
-- **OlegNotHehe** (Oleg Rokin) — Researcher
+Setup, schema rules, and the result boundary: [docs/benchmark.md](docs/benchmark.md).
 
-## Supervisor
+## Development
 
-- **Mark Blumenau**
+```bash
+uv sync --locked
+uv run --locked pytest -q
+uv run --locked ruff check app benchmark tests
+uv run --locked ruff format --check app benchmark tests
+```
+
+The test suite is CPU-only and isolates model backends; it covers tracking,
+calibration, merging, jersey pooling, smoothing, upload and queue failure
+paths, worker lifecycle, readiness, model integrity, and benchmark conversion.
+
+```text
+app/api/          job and artifact endpoints
+app/models/       SQLite job state
+app/services/     inference, aggregation, rendering, worker
+app/utils/        CUDA bootstrap and model registry
+app/vendor/       trimmed BoxMOT and PnLCalib runtime code
+benchmark/        SoccerNetGS conversion and evaluation
+docs/             benchmark evidence and evaluation boundary
+tests/            CPU regression suite
+```
+
+## Licensing
+
+Original service code is MIT. The vendored BoxMOT subset is AGPL-3.0, the
+vendored PnLCalib subset is GPL-2.0; license texts, upstream links, file
+scopes, and local modifications are recorded under `app/vendor/boxmot` and
+`app/vendor/pnlcalib`. A combined distribution or hosted deployment must
+satisfy the applicable copyleft obligations.
