@@ -1,17 +1,12 @@
-# Mikel Broström 🔥 BoxMOT 🧾 AGPL-3.0 license
-
 from __future__ import annotations
-
-from typing import Optional
 
 import cv2
 import numpy as np
 
-from app.vendor.boxmot.motion.cmc.base_cmc import BaseCMC
 from app.vendor.boxmot.utils import logger as LOGGER
 
 
-class ECC(BaseCMC):
+class ECC:
     """
     OpenCV ECC-based motion estimation using cv2.findTransformECC.
     Produces:
@@ -25,10 +20,8 @@ class ECC(BaseCMC):
         eps: float = 1e-5,
         max_iter: int = 100,
         scale: float = 0.15,
-        align: bool = False,
         grayscale: bool = True,
     ) -> None:
-        self.align = bool(align)
         self.grayscale = bool(grayscale)
         self.scale = float(scale)
         self.warp_mode = int(warp_mode)
@@ -39,21 +32,23 @@ class ECC(BaseCMC):
             float(eps),
         )
 
-        self.prev_img: Optional[np.ndarray] = None
-        self.prev_img_aligned: Optional[np.ndarray] = None
+        self.prev_img: np.ndarray | None = None
 
-    def apply(self, img: np.ndarray, dets: Optional[np.ndarray] = None) -> np.ndarray:
+    def _preprocess(self, img: np.ndarray) -> np.ndarray:
+        out = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if self.grayscale else img
+        return cv2.resize(out, (0, 0), fx=self.scale, fy=self.scale, interpolation=cv2.INTER_LINEAR)
+
+    def apply(self, img: np.ndarray) -> np.ndarray:
         if self.warp_mode == cv2.MOTION_HOMOGRAPHY:
             warp_matrix = np.eye(3, 3, dtype=np.float32)
         else:
             warp_matrix = np.eye(2, 3, dtype=np.float32)
 
         if self.prev_img is None:
-            self.prev_img = self.preprocess(img)
-            self.prev_img_aligned = None
+            self.prev_img = self._preprocess(img)
             return warp_matrix
 
-        curr = self.preprocess(img)
+        curr = self._preprocess(img)
 
         try:
             _, warp_matrix = cv2.findTransformECC(
@@ -66,15 +61,10 @@ class ECC(BaseCMC):
                 1,
             )
         except cv2.error as e:
-            # StsNoConv => ECC did not converge; return identity (common in practice).
-            try:
-                if e.code == cv2.Error.StsNoConv:
-                    LOGGER.warning("ECC did not converge; returning identity warp.")
-                    self.prev_img = curr
-                    self.prev_img_aligned = None
-                    return warp_matrix
-            except Exception:
-                pass
+            if e.code == cv2.Error.StsNoConv:
+                LOGGER.warning("ECC did not converge; returning identity warp.")
+                self.prev_img = curr
+                return warp_matrix
             raise
 
         # upscale translation back to original image coordinates
@@ -82,15 +72,6 @@ class ECC(BaseCMC):
             warp_matrix = warp_matrix.copy()
             warp_matrix[0, 2] /= self.scale
             warp_matrix[1, 2] /= self.scale
-
-        if self.align:
-            h, w = self.prev_img.shape[:2]
-            if self.warp_mode == cv2.MOTION_HOMOGRAPHY:
-                self.prev_img_aligned = cv2.warpPerspective(self.prev_img, warp_matrix, (w, h), flags=cv2.INTER_LINEAR)
-            else:
-                self.prev_img_aligned = cv2.warpAffine(self.prev_img, warp_matrix, (w, h), flags=cv2.INTER_LINEAR)
-        else:
-            self.prev_img_aligned = None
 
         self.prev_img = curr
         return warp_matrix
