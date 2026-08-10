@@ -42,6 +42,7 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+soccer_gsr_jobs/
 
 # Temp files
 /tmp/
@@ -59,6 +60,11 @@ logs/
 *.pth
 
 # Output videos / clips / renders
+/artifacts/
+/data/
+/predictions/
+/metrics-*.json
+/gsr.json
 output_*.mp4
 processed_*.mp4
 *.mp4
@@ -69,18 +75,6 @@ processed_*.mp4
 *.gif
 *_gsr.json
 *.pkl
-
-# Local-only docs
-docs/
-
-# One-off dev scripts (presentation builders, diagnostics) — kept locally
-scripts/build_presentation.py
-scripts/add_method_slides.py
-scripts/add_video_gsr_slides.py
-scripts/refine_method_slides.py
-scripts/diag_aggregate.py
-scripts/diag_minimap.py
-scripts/iter_aggregate.py
 
 # Testing
 .pytest_cache/
