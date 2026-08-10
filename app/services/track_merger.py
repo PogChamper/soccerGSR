@@ -1,15 +1,18 @@
-"""Consolidate fragmented BoT-SORT tracks into per-player identities.
+"""Offline consolidation of tracker fragments into stable identities.
 
-Merge signals, in priority order: same confident jersey number, high DINOv3
-cosine similarity, hard cap per class (longest-K survive, rest relabelled to
-the best compatible keeper). Operates in-place on ClipState; runs after
-jersey vote collection and before team clustering.
+The merger only uses clip-level evidence available at inference time. Person
+fragments are linked by high-confidence ``(team, jersey)`` agreement, feasible
+motion in pitch coordinates, and optionally a validated appearance threshold.
+Every union preserves the invariant of at most one observation per identity and
+frame.
 """
+
 from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -18,380 +21,462 @@ from app.services.clip_state import ClipState, TrackInfo
 logger = logging.getLogger(__name__)
 
 
-# ---- defaults --------------------------------------------------------------
+@dataclass(frozen=True)
+class MergeConfig:
+    """Thresholds validated with the SoccerNet OSNet pipeline."""
 
-DEFAULT_MAX_PLAYERS = 24          # 11+11 outfield + a couple of subs warming up
-DEFAULT_MAX_GOALKEEPERS = 2
-DEFAULT_MAX_REFEREES = 4
-DEFAULT_MAX_BALLS = 1
-DEFAULT_COSINE_THRESHOLD = 0.86   # tuned for L2-normalised DINOv3 ViT-S+
-DEFAULT_MIN_TRACK_LEN = 3         # frames; shorter tracks are always candidates to drop
-
-# Teleport guard for appearance/hard-cap merges (jersey merges bypass it):
-# refuse a merge when the temporal gap is too long or the implied screen-space
-# motion across it is physically impossible. Keeps look-alikes (two GKs, two
-# referees) from being glued into one identity that jumps across the pitch.
-MAX_MERGE_GAP_FRAMES = 120        # ~4.8 s at 25 fps
-MAX_MERGE_SPEED_PXPF = 35.0       # px/frame of bbox-centre travel across the gap
-MERGE_DIST_MARGIN_PX = 160.0      # slack for camera pan/zoom on top of the speed
+    max_gap_seconds: float = 6.0
+    max_speed_mps: float = 9.0
+    distance_slack_m: float = 7.0
+    min_cosine_similarity: float | None = 0.90
+    min_jersey_confidence: float = 0.65
 
 
-# ---- overlap-aware union-find ---------------------------------------------
+class EmbeddingSource(Protocol):
+    def mean_embedding(self, track_id: int) -> np.ndarray | None: ...
 
 
-class _OverlapAwareUF:
-    """Union-find that refuses any merge whose resulting cluster would have
-    two members visible in the same frame — holds even transitively through
-    a chain of pairwise-allowed merges (frame-sets are merged with clusters).
-    """
+@dataclass
+class _Fragment:
+    track_id: int
+    cls_id: int
+    team_id: int | None
+    jersey_number: int | None
+    jersey_confidence: float | None
+    frames: set[int]
+    first_frame: int
+    last_frame: int
+    first_pitch_frame: int | None
+    last_pitch_frame: int | None
+    first_pitch: tuple[float, float] | None
+    last_pitch: tuple[float, float] | None
+    embedding: np.ndarray | None
 
-    def __init__(self, frames_per_track: Dict[int, set]):
-        self.parent = {tid: tid for tid in frames_per_track}
-        # take a copy so we can mutate freely
-        self.frames = {tid: set(frames_per_track[tid]) for tid in frames_per_track}
 
-    def find(self, x):
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
+class _OverlapAwareUnionFind:
+    """Union-find that preserves frame and identity consistency."""
 
-    def can_union(self, a, b) -> bool:
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
+    def __init__(self, fragments: dict[int, _Fragment]) -> None:
+        self.parent = {track_id: track_id for track_id in fragments}
+        self.frames = {track_id: set(fragment.frames) for track_id, fragment in fragments.items()}
+        self.jerseys = {
+            track_id: ({fragment.jersey_number} if fragment.jersey_number is not None else set())
+            for track_id, fragment in fragments.items()
+        }
+        self.members = {track_id: {track_id} for track_id in fragments}
+
+    def find(self, track_id: int) -> int:
+        parent = self.parent
+        while parent[track_id] != track_id:
+            parent[track_id] = parent[parent[track_id]]
+            track_id = parent[track_id]
+        return track_id
+
+    def can_union(self, left: int, right: int) -> bool:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
             return False
-        # the two cluster frame-sets must be disjoint
-        return self.frames[ra].isdisjoint(self.frames[rb])
-
-    def union(self, a, b) -> bool:
-        if not self.can_union(a, b):
+        if not self.frames[left_root].isdisjoint(self.frames[right_root]):
             return False
-        ra, rb = self.find(a), self.find(b)
-        # canonical id = lower (for stable, deterministic remap)
-        if ra > rb:
-            ra, rb = rb, ra
-        self.parent[rb] = ra
-        self.frames[ra].update(self.frames[rb])
-        del self.frames[rb]
+        # Unknown numbers can join a numbered component. Two different known
+        # numbers cannot become one identity through transitive motion links.
+        known_numbers = self.jerseys[left_root] | self.jerseys[right_root]
+        if len(known_numbers) > 1:
+            return False
+        return True
+
+    def union(self, left: int, right: int) -> bool:
+        if not self.can_union(left, right):
+            return False
+        left_root = self.find(left)
+        right_root = self.find(right)
+
+        # Stable roots make output deterministic across runs.
+        if left_root > right_root:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+        self.frames[left_root].update(self.frames.pop(right_root))
+        self.jerseys[left_root].update(self.jerseys.pop(right_root))
+        self.members[left_root].update(self.members.pop(right_root))
         return True
 
 
-# ---- helpers ---------------------------------------------------------------
+@dataclass(frozen=True)
+class _MotionComponent:
+    root: int
+    scope: _Fragment
+    first_frame: int
+    last_frame: int
+    first_pitch: tuple[float, float]
+    last_pitch: tuple[float, float]
 
 
-def _cos(u: np.ndarray, v: np.ndarray) -> float:
-    return float(np.dot(u, v))
+def _unit(vector: np.ndarray | None) -> np.ndarray | None:
+    if vector is None:
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return None
+    return (np.asarray(vector, dtype=np.float32) / norm).astype(np.float32)
 
 
-def _track_endpoints(state: ClipState) -> Dict[int, Tuple[int, int, Tuple[float, float], Tuple[float, float]]]:
-    """Per-track (first_frame, last_frame, first_centre, last_centre) in screen px."""
-    first: Dict[int, Tuple[int, Tuple[float, float]]] = {}
-    last: Dict[int, Tuple[int, Tuple[float, float]]] = {}
-    for o in state.observations:
-        tid = o.track_id
-        if tid is None:
-            continue
-        cx = (o.bbox_xyxy[0] + o.bbox_xyxy[2]) * 0.5
-        cy = (o.bbox_xyxy[1] + o.bbox_xyxy[3]) * 0.5
-        if tid not in first or o.frame_idx < first[tid][0]:
-            first[tid] = (o.frame_idx, (cx, cy))
-        if tid not in last or o.frame_idx > last[tid][0]:
-            last[tid] = (o.frame_idx, (cx, cy))
-    out: Dict[int, Tuple[int, int, Tuple[float, float], Tuple[float, float]]] = {}
-    for tid in first:
-        out[tid] = (first[tid][0], last[tid][0], first[tid][1], last[tid][1])
-    return out
-
-
-def _merge_compatible(a: int, b: int, endp: dict) -> bool:
-    """Reject appearance merges that would imply a teleport between fragments."""
-    ea, eb = endp.get(a), endp.get(b)
-    if ea is None or eb is None:
-        return True
-    # order by time
-    if ea[0] <= eb[0]:
-        earlier, later = ea, eb
-    else:
-        earlier, later = eb, ea
-    gap = later[0] - earlier[1]            # later.first - earlier.last
-    if gap <= 0:
-        return True                         # overlapping in time -> UF blocks it
-    if gap > MAX_MERGE_GAP_FRAMES:
+def _same_scope(left: _Fragment, right: _Fragment) -> bool:
+    """Return whether two fragments may represent the same field object."""
+    if left.cls_id != right.cls_id:
         return False
-    ex, ey = earlier[3]                      # earlier.last_centre
-    lx, ly = later[2]                        # later.first_centre
-    dist = ((lx - ex) ** 2 + (ly - ey) ** 2) ** 0.5
-    return dist <= MAX_MERGE_SPEED_PXPF * gap + MERGE_DIST_MARGIN_PX
+    if left.cls_id in (0, 1):
+        return (
+            left.team_id is not None and right.team_id is not None and left.team_id == right.team_id
+        )
+    return left.cls_id in (2, 3)
 
 
-# ---- main API --------------------------------------------------------------
+def _jersey_compatible(left: _Fragment, right: _Fragment) -> bool:
+    return (
+        left.jersey_number is None
+        or right.jersey_number is None
+        or left.jersey_number == right.jersey_number
+    )
+
+
+def _build_fragments(
+    state: ClipState,
+    embedding_source: EmbeddingSource | None,
+) -> dict[int, _Fragment]:
+    observations = state.observations_by_track()
+    fragments: dict[int, _Fragment] = {}
+
+    for track_id, track in state.tracks.items():
+        track_observations = sorted(observations.get(track_id, ()), key=lambda item: item.frame_idx)
+        if not track_observations:
+            continue
+        pitch = [
+            (observation.frame_idx, observation.pitch_xy)
+            for observation in track_observations
+            if observation.pitch_xy is not None
+        ]
+        embedding = (
+            embedding_source.mean_embedding(track_id)
+            if embedding_source is not None
+            else _unit(track.embedding_mean)
+        )
+        fragments[track_id] = _Fragment(
+            track_id=track_id,
+            cls_id=track.cls_id,
+            team_id=track.team_id,
+            jersey_number=track.jersey_number,
+            jersey_confidence=track.jersey_confidence,
+            frames={observation.frame_idx for observation in track_observations},
+            first_frame=track_observations[0].frame_idx,
+            last_frame=track_observations[-1].frame_idx,
+            first_pitch_frame=pitch[0][0] if pitch else None,
+            last_pitch_frame=pitch[-1][0] if pitch else None,
+            first_pitch=pitch[0][1] if pitch else None,
+            last_pitch=pitch[-1][1] if pitch else None,
+            embedding=_unit(embedding),
+        )
+    return fragments
+
+
+def _merge_by_jersey(
+    fragments: dict[int, _Fragment],
+    union_find: _OverlapAwareUnionFind,
+    config: MergeConfig,
+) -> int:
+    groups: dict[tuple[int, int], list[_Fragment]] = defaultdict(list)
+    for fragment in fragments.values():
+        if (
+            fragment.cls_id == 0
+            and fragment.team_id is not None
+            and fragment.jersey_number is not None
+            and (fragment.jersey_confidence or 0.0) >= config.min_jersey_confidence
+        ):
+            groups[(fragment.team_id, fragment.jersey_number)].append(fragment)
+
+    merged = 0
+    for group in groups.values():
+        ordered = sorted(group, key=lambda item: (item.first_frame, item.track_id))
+        for index, left in enumerate(ordered):
+            for right in ordered[index + 1 :]:
+                merged += int(union_find.union(left.track_id, right.track_id))
+    return merged
+
+
+def _merge_by_motion(
+    fragments: dict[int, _Fragment],
+    union_find: _OverlapAwareUnionFind,
+    config: MergeConfig,
+    fps: float,
+) -> int:
+    def components() -> list[_MotionComponent]:
+        result: list[_MotionComponent] = []
+        for root, track_ids in sorted(union_find.members.items()):
+            members = [fragments[track_id] for track_id in track_ids]
+            with_start = [member for member in members if member.first_pitch_frame is not None]
+            with_end = [member for member in members if member.last_pitch_frame is not None]
+            if not with_start or not with_end:
+                continue
+            first = min(
+                with_start,
+                key=lambda member: (member.first_pitch_frame, member.track_id),
+            )
+            last = max(
+                with_end,
+                key=lambda member: (member.last_pitch_frame, -member.track_id),
+            )
+            assert first.first_pitch_frame is not None and first.first_pitch is not None
+            assert last.last_pitch_frame is not None and last.last_pitch is not None
+            result.append(
+                _MotionComponent(
+                    root=root,
+                    scope=fragments[min(track_ids)],
+                    first_frame=int(first.first_pitch_frame),
+                    last_frame=int(last.last_pitch_frame),
+                    first_pitch=first.first_pitch,
+                    last_pitch=last.last_pitch,
+                )
+            )
+        return result
+
+    merged = 0
+    max_gap_frames = max(1, int(round(config.max_gap_seconds * fps)))
+
+    # Merge one component at a time and recompute its chronological tail.
+    # Otherwise a later fragment could incorrectly link back to an old member
+    # of a component and bypass the speed constraint.
+    while True:
+        values = components()
+        merged_this_round = False
+        for current in sorted(values, key=lambda item: (item.first_frame, item.root)):
+            candidates: list[tuple[float, int, int]] = []
+            for previous in values:
+                if previous.root == current.root:
+                    continue
+                if not _same_scope(previous.scope, current.scope):
+                    continue
+                if not union_find.can_union(previous.root, current.root):
+                    continue
+                gap = current.first_frame - previous.last_frame
+                if gap <= 0 or gap > max_gap_frames:
+                    continue
+                distance = float(
+                    np.hypot(
+                        previous.last_pitch[0] - current.first_pitch[0],
+                        previous.last_pitch[1] - current.first_pitch[1],
+                    )
+                )
+                reachable = config.max_speed_mps * (gap / fps) + config.distance_slack_m
+                if distance <= reachable:
+                    # Distance, then temporal gap, then stable root resolve ties.
+                    candidates.append((distance, gap, previous.root))
+
+            for _, _, previous_root in sorted(candidates):
+                if union_find.union(previous_root, current.root):
+                    merged += 1
+                    merged_this_round = True
+                    break
+            if merged_this_round:
+                break
+        if not merged_this_round:
+            return merged
+
+
+def _motion_feasible(left: _Fragment, right: _Fragment, config: MergeConfig, fps: float) -> bool:
+    """Refuse a pair only when known pitch endpoints prove an impossible move."""
+    earlier, later = sorted((left, right), key=lambda fragment: fragment.first_frame)
+    if (
+        earlier.last_pitch is None
+        or later.first_pitch is None
+        or later.first_pitch_frame <= earlier.last_pitch_frame
+    ):
+        return True
+    gap = later.first_pitch_frame - earlier.last_pitch_frame
+    distance = float(
+        np.hypot(
+            earlier.last_pitch[0] - later.first_pitch[0],
+            earlier.last_pitch[1] - later.first_pitch[1],
+        )
+    )
+    return distance <= config.max_speed_mps * (gap / fps) + config.distance_slack_m
+
+
+def _merge_by_appearance(
+    fragments: dict[int, _Fragment],
+    union_find: _OverlapAwareUnionFind,
+    config: MergeConfig,
+    fps: float,
+) -> int:
+    threshold = config.min_cosine_similarity
+    if threshold is None:
+        return 0
+
+    candidates: list[tuple[float, int, int]] = []
+    values = list(fragments.values())
+    for index, left in enumerate(values):
+        if left.embedding is None or left.cls_id == 3:
+            continue
+        for right in values[index + 1 :]:
+            if right.embedding is None:
+                continue
+            if not _same_scope(left, right) or not _jersey_compatible(left, right):
+                continue
+            if not _motion_feasible(left, right, config, fps):
+                continue
+            similarity = float(left.embedding @ right.embedding)
+            if similarity >= threshold:
+                candidates.append((similarity, left.track_id, right.track_id))
+
+    merged = 0
+    for _, left, right in sorted(candidates, reverse=True):
+        merged += int(union_find.union(left, right))
+    return merged
+
+
+def _merge_ball_fragments(
+    fragments: dict[int, _Fragment],
+    union_find: _OverlapAwareUnionFind,
+) -> int:
+    ball_ids = sorted(fragment.track_id for fragment in fragments.values() if fragment.cls_id == 3)
+    if not ball_ids:
+        return 0
+    anchor = ball_ids[0]
+    return sum(int(union_find.union(anchor, track_id)) for track_id in ball_ids[1:])
+
+
+def _weighted_choice(members: list[TrackInfo], attribute: str) -> int | str | None:
+    votes: Counter = Counter()
+    for member in members:
+        value = getattr(member, attribute)
+        if value is not None:
+            votes[value] += max(member.n_observations, 1)
+    return votes.most_common(1)[0][0] if votes else None
+
+
+def _pool_track_info(
+    new_track_id: int,
+    members: list[TrackInfo],
+) -> TrackInfo:
+    observation_count = sum(max(member.n_observations, 0) for member in members)
+    cls_id = int(_weighted_choice(members, "cls_id") or 0)
+    team_id = _weighted_choice(members, "team_id")
+    team_label = _weighted_choice(members, "team_label")
+
+    jersey_tens = np.zeros(10, dtype=np.float32)
+    jersey_units = np.zeros(10, dtype=np.float32)
+    jersey_vote_count = 0
+    for member in members:
+        if member.jersey_logits_tens is not None:
+            jersey_tens += np.asarray(member.jersey_logits_tens, dtype=np.float32)
+        if member.jersey_logits_units is not None:
+            jersey_units += np.asarray(member.jersey_logits_units, dtype=np.float32)
+        jersey_vote_count += member.jersey_vote_count
+
+    provisional = max(
+        members,
+        key=lambda member: member.jersey_confidence or 0.0,
+    )
+    embeddings = [
+        (member.embedding_mean, max(member.n_observations, 1))
+        for member in members
+        if member.embedding_mean is not None
+    ]
+    embedding = None
+    if embeddings:
+        total_weight = sum(weight for _, weight in embeddings)
+        mean = sum(vector * weight for vector, weight in embeddings) / total_weight
+        embedding = _unit(mean)
+
+    return TrackInfo(
+        track_id=new_track_id,
+        cls_id=cls_id,
+        cls_name=next(
+            (member.cls_name for member in members if member.cls_id == cls_id),
+            members[0].cls_name,
+        ),
+        team_id=int(team_id) if team_id is not None else None,
+        team_label=str(team_label) if team_label is not None else None,
+        jersey_number=provisional.jersey_number,
+        jersey_confidence=provisional.jersey_confidence,
+        n_frames_visible_gate=sum(member.n_frames_visible_gate for member in members),
+        first_frame=min(member.first_frame for member in members),
+        last_frame=max(member.last_frame for member in members),
+        embedding_mean=embedding,
+        n_observations=observation_count,
+        jersey_logits_tens=jersey_tens.tolist() if jersey_vote_count else None,
+        jersey_logits_units=jersey_units.tolist() if jersey_vote_count else None,
+        jersey_vote_count=jersey_vote_count,
+    )
+
+
+def _apply_mapping(state: ClipState, root_mapping: dict[int, int]) -> dict[int, int]:
+    groups: dict[int, list[int]] = defaultdict(list)
+    for old_track_id, root in root_mapping.items():
+        groups[root].append(old_track_id)
+
+    ordered_roots = sorted(
+        groups,
+        key=lambda root: (
+            min(state.tracks[track_id].first_frame for track_id in groups[root]),
+            root,
+        ),
+    )
+    compact = {root: index + 1 for index, root in enumerate(ordered_roots)}
+    mapping = {old_track_id: compact[root] for old_track_id, root in root_mapping.items()}
+
+    for observation in state.observations:
+        if observation.track_id in mapping:
+            observation.track_id = mapping[observation.track_id]
+
+    new_tracks: dict[int, TrackInfo] = {}
+    for root, old_track_ids in groups.items():
+        new_track_id = compact[root]
+        members = [state.tracks[track_id] for track_id in old_track_ids]
+        new_tracks[new_track_id] = _pool_track_info(new_track_id, members)
+    state.tracks = new_tracks
+    return mapping
 
 
 def merge_tracks(
     state: ClipState,
     *,
-    embedder_source=None,
-    cosine_threshold: float = DEFAULT_COSINE_THRESHOLD,
-    max_players: int = DEFAULT_MAX_PLAYERS,
-    max_goalkeepers: int = DEFAULT_MAX_GOALKEEPERS,
-    max_referees: int = DEFAULT_MAX_REFEREES,
-    max_balls: int = DEFAULT_MAX_BALLS,
-    min_track_len: int = DEFAULT_MIN_TRACK_LEN,
-) -> Dict[int, int]:
-    """Consolidate fragmented tracks in ``state`` in-place.
+    embedder_source: EmbeddingSource | None = None,
+    config: MergeConfig | None = None,
+) -> dict[int, int]:
+    """Merge offline fragments in place and return ``old_id -> new_id``.
 
-    ``embedder_source`` should expose a ``mean_embedding(track_id) ->
-    Optional[np.ndarray]`` callable (TeamClassifier satisfies this).
-    Returns the {old_track_id -> new_track_id} mapping that was applied.
+    Team assignment and pitch calibration must run before this function. If a
+    person fragment has no team, conservative behavior is to leave it unmerged.
     """
     if not state.tracks:
         return {}
 
-    # 1. Collect per-track summary that the merger needs.
-    embeddings: Dict[int, np.ndarray] = {}
-    if embedder_source is not None:
-        for tid in state.tracks:
-            emb = embedder_source.mean_embedding(tid)
-            if emb is not None:
-                embeddings[tid] = emb
-                state.tracks[tid].embedding_mean = emb  # cache for later use
+    config = config or MergeConfig()
+    fragments = _build_fragments(state, embedder_source)
+    if not fragments:
+        return {}
 
-    # n_observations needs to be computed once
-    obs_count = Counter(o.track_id for o in state.observations if o.track_id is not None)
-    for tid, ti in state.tracks.items():
-        ti.n_observations = obs_count.get(tid, 0)
+    for track_id, fragment in fragments.items():
+        state.tracks[track_id].embedding_mean = fragment.embedding
+        state.tracks[track_id].n_observations = len(fragment.frames)
 
-    # 2. Compute exact frame-set per track (correct intervals; observations
-    #    can have gaps) and build the overlap-aware union-find.
-    frames_per_track: Dict[int, set] = defaultdict(set)
-    for o in state.observations:
-        if o.track_id is not None:
-            frames_per_track[o.track_id].add(o.frame_idx)
-    # ensure every track has an entry (defensive)
-    for tid in state.tracks:
-        frames_per_track.setdefault(tid, set())
+    fps = max(float(state.meta.fps), 1.0)
+    union_find = _OverlapAwareUnionFind(fragments)
+    jersey_merges = _merge_by_jersey(fragments, union_find, config)
+    motion_merges = _merge_by_motion(fragments, union_find, config, fps)
+    appearance_merges = _merge_by_appearance(fragments, union_find, config, fps)
+    ball_merges = _merge_ball_fragments(fragments, union_find)
 
-    by_cls: Dict[int, List[int]] = defaultdict(list)
-    for tid, ti in state.tracks.items():
-        by_cls[ti.cls_id].append(tid)
-
-    endp = _track_endpoints(state)
-    uf = _OverlapAwareUF(frames_per_track)
-
-    for cls_id, tids in by_cls.items():
-        # ---- step 2a: jersey-number merging (only for players + goalkeepers)
-        if cls_id in (0, 1):
-            by_jersey: Dict[int, List[int]] = defaultdict(list)
-            for tid in tids:
-                ti = state.tracks[tid]
-                if ti.jersey_number is not None and (ti.jersey_confidence or 0) > 0.65:
-                    by_jersey[ti.jersey_number].append(tid)
-            for jersey, group in by_jersey.items():
-                # union-find handles transitive overlap correctness
-                group_sorted = sorted(group, key=lambda t: state.tracks[t].first_frame)
-                for i in range(len(group_sorted)):
-                    for j in range(i + 1, len(group_sorted)):
-                        a, b = group_sorted[i], group_sorted[j]
-                        if uf.union(a, b):
-                            logger.debug(f"merge by jersey #{jersey}: {a}<-{b}")
-
-        # ---- step 2b: embedding similarity (skip ball; ball has no useful emb)
-        if cls_id != 3:
-            cand = [t for t in tids if t in embeddings]
-            # sort by first_frame for deterministic merging order; greedily try
-            # the highest-similarity allowed merge first
-            pairs = []
-            for i in range(len(cand)):
-                for j in range(i + 1, len(cand)):
-                    a, b = cand[i], cand[j]
-                    s = _cos(embeddings[a], embeddings[b])
-                    if s >= cosine_threshold and _merge_compatible(a, b, endp):
-                        pairs.append((s, a, b))
-            pairs.sort(reverse=True)
-            for s, a, b in pairs:
-                if uf.union(a, b):
-                    logger.debug(
-                        f"merge by embedding cls={cls_id}: {a}<-{b} cos={s:.2f}"
-                    )
-
-        # ---- step 2c: ball — collapse all into a single canonical track
-        if cls_id == 3 and len(tids) > 1:
-            anchor = tids[0]
-            for t in tids[1:]:
-                uf.union(anchor, t)
-
-    # 3. Apply the mapping (old -> new canonical).
-    mapping_initial = {tid: uf.find(tid) for tid in state.tracks}
-    n_after_merge = len(set(mapping_initial.values()))
+    root_mapping = {track_id: union_find.find(track_id) for track_id in fragments}
+    mapping = _apply_mapping(state, root_mapping)
     logger.info(
-        f"track_merger: {len(state.tracks)} fragments -> {n_after_merge} after "
-        f"(jersey + embedding + ball-collapse)"
+        "offline merge: %d fragments -> %d identities "
+        "(jersey=%d, motion=%d, appearance=%d, ball=%d)",
+        len(fragments),
+        len(state.tracks),
+        jersey_merges,
+        motion_merges,
+        appearance_merges,
+        ball_merges,
     )
-
-    # 4. Hard cap per (cls, team) — operate on the merged groups.
-    #    We cluster by cls_id only (team_id not yet assigned at this stage).
-    group_sizes = {root: 0 for root in set(mapping_initial.values())}
-    group_cls = {root: state.tracks[root].cls_id for root in group_sizes}
-    for tid, root in mapping_initial.items():
-        group_sizes[root] += state.tracks[tid].n_observations
-
-    by_cls_groups: Dict[int, List[int]] = defaultdict(list)
-    for root, c in group_cls.items():
-        by_cls_groups[c].append(root)
-
-    cls_caps = {0: max_players, 1: max_goalkeepers, 2: max_referees, 3: max_balls}
-
-    # root-level endpoints (for the hard-cap teleport guard)
-    root_members: Dict[int, List[int]] = defaultdict(list)
-    for tid, root in mapping_initial.items():
-        root_members[root].append(tid)
-    root_endp: Dict[int, Tuple[int, int, Tuple[float, float], Tuple[float, float]]] = {}
-    for root, members in root_members.items():
-        eps = [endp[t] for t in members if t in endp]
-        if not eps:
-            continue
-        ff = min(e[0] for e in eps)
-        lf = max(e[1] for e in eps)
-        fc = min(eps, key=lambda e: e[0])[2]
-        lc = max(eps, key=lambda e: e[1])[3]
-        root_endp[root] = (ff, lf, fc, lc)
-
-    final_mapping = dict(mapping_initial)
-    for c, roots in by_cls_groups.items():
-        cap = cls_caps.get(c, 32)
-        if len(roots) <= cap:
-            continue
-        # keep top-K by length
-        roots_sorted = sorted(roots, key=lambda r: -group_sizes[r])
-        keepers = roots_sorted[:cap]
-        droppers = roots_sorted[cap:]
-        # for each dropper, find the most similar keeper that is ALSO motion-
-        # compatible (no teleport). If none is compatible, leave the dropper as
-        # its own identity rather than fabricating an impossible jump.
-        for d in droppers:
-            best = None
-            best_score = -1.0
-            d_emb = embeddings.get(d)
-            for k in keepers:
-                if not _merge_compatible(d, k, root_endp):
-                    continue
-                k_emb = embeddings.get(k)
-                s = _cos(d_emb, k_emb) if (d_emb is not None and k_emb is not None) else 0.0
-                if s > best_score:
-                    best_score = s
-                    best = k
-            if best is None:
-                continue  # keep dropper as a separate surviving identity
-            for tid in list(final_mapping):
-                if final_mapping[tid] == d:
-                    final_mapping[tid] = best
-            logger.debug(
-                f"hard-cap cls={c}: {d} -> {best} (cos={best_score:.2f})"
-            )
-
-    # 5. Drop very short fragments that survived (noise tracks of len < min)
-    surviving_roots = {root for root in final_mapping.values()}
-    drop_roots = set()
-    for root in surviving_roots:
-        members = [t for t, r in final_mapping.items() if r == root]
-        total = sum(state.tracks[t].n_observations for t in members)
-        if total < min_track_len:
-            drop_roots.add(root)
-    for tid in list(final_mapping):
-        if final_mapping[tid] in drop_roots:
-            final_mapping[tid] = -1  # marker for "drop this observation"
-
-    # 6. Write back to state.observations and state.tracks.
-    keep_mapping = {old: new for old, new in final_mapping.items() if new != -1}
-    for obs in state.observations:
-        if obs.track_id is None:
-            continue
-        new_tid = final_mapping.get(obs.track_id, obs.track_id)
-        if new_tid == -1:
-            obs.track_id = None
-            continue
-        obs.track_id = new_tid
-
-    # Rebuild state.tracks: collapse merged fragments.
-    new_tracks: Dict[int, TrackInfo] = {}
-    by_root: Dict[int, List[TrackInfo]] = defaultdict(list)
-    for old_tid, ti in state.tracks.items():
-        new_tid = final_mapping[old_tid]
-        if new_tid == -1:
-            continue
-        by_root[new_tid].append(ti)
-
-    for new_tid, members in by_root.items():
-        # canonical = the one whose track_id == new_tid
-        canon = next((m for m in members if m.track_id == new_tid), members[0])
-        cls_id = Counter([m.cls_id for m in members]).most_common(1)[0][0]
-        first = min(m.first_frame for m in members)
-        last = max(m.last_frame for m in members)
-        n_obs = sum(m.n_observations for m in members)
-        n_vis = sum(m.n_frames_visible_gate for m in members)
-
-        # Pool jersey votes across all fragments of this identity so the
-        # authoritative number can be (re)committed from the combined
-        # evidence. A provisional number is also carried for any interim use.
-        pooled_votes: Dict[int, float] = defaultdict(float)
-        pooled_counts: Dict[int, int] = defaultdict(int)
-        for m in members:
-            for num, w in (m.jersey_votes or {}).items():
-                pooled_votes[num] += w
-            for num, c in (m.jersey_vote_counts or {}).items():
-                pooled_counts[num] += c
-
-        jersey = None
-        jersey_conf = None
-        for m in sorted(
-            members,
-            key=lambda x: (x.jersey_confidence or 0.0),
-            reverse=True,
-        ):
-            if m.jersey_number is not None:
-                jersey = m.jersey_number
-                jersey_conf = m.jersey_confidence
-                break
-
-        # mean of embedding means (re-normalised)
-        emb = None
-        emb_list = [m.embedding_mean for m in members if m.embedding_mean is not None]
-        if emb_list:
-            agg = np.mean(np.stack(emb_list), axis=0)
-            n = float(np.linalg.norm(agg))
-            if n > 1e-12:
-                emb = (agg / n).astype(np.float32)
-
-        new_tracks[new_tid] = TrackInfo(
-            track_id=new_tid,
-            cls_id=cls_id,
-            cls_name=canon.cls_name,
-            first_frame=first,
-            last_frame=last,
-            n_frames_visible_gate=n_vis,
-            jersey_number=jersey,
-            jersey_confidence=jersey_conf,
-            embedding_mean=emb,
-            n_observations=n_obs,
-            jersey_votes=dict(pooled_votes),
-            jersey_vote_counts=dict(pooled_counts),
-        )
-
-    # 7. Compact renumbering: relabel surviving identities to a dense 1..N
-    #    range (ordered by first appearance) so downstream IDs never look like
-    #    "hundreds of tracks" even when the raw tracker churned through high
-    #    ids. Compose this with keep_mapping so callers remap in one shot.
-    ordered = sorted(new_tracks.values(), key=lambda t: (t.first_frame, t.track_id))
-    renum: Dict[int, int] = {t.track_id: i + 1 for i, t in enumerate(ordered)}
-
-    renamed: Dict[int, TrackInfo] = {}
-    for old_root, ti in new_tracks.items():
-        ti.track_id = renum[old_root]
-        renamed[ti.track_id] = ti
-    for obs in state.observations:
-        if obs.track_id is not None and obs.track_id in renum:
-            obs.track_id = renum[obs.track_id]
-    keep_mapping = {old: renum[new] for old, new in keep_mapping.items() if new in renum}
-
-    state.tracks = renamed
-    return keep_mapping
+    return mapping

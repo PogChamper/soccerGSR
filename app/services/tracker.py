@@ -1,25 +1,17 @@
-"""Multi-object tracker wrapper around our vendored BoT-SORT.
+"""Per-clip BoT-SORT wrapper using external OSNet embeddings."""
 
-Per-clip instance — never shared across requests because tracker state
-(Kalman filters, lost stracks, frame_count) is clip-scoped.
-
-The vendored ``app.vendor.boxmot`` is a torch-free fork of BoT-SORT (see
-``app/vendor/boxmot/__init__.py``). ReID is not built-in: pre-computed
-appearance embeddings (DINOv3, see ``app.services.embedder``) are passed via
-``embs`` to ``update()``. By default ``with_reid=True``; the job worker
-falls back to ``with_reid=False`` (motion + IoU + CMC only) when the
-embedder model is unavailable.
-"""
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
 
 import numpy as np
 
 from app.services.detector import Detection
 
 logger = logging.getLogger(__name__)
+_EMBEDDING_DIM = 512
+_HUMAN_GROUP = 0
+_BALL_GROUP = 1
 
 
 class BoxmotTracker:
@@ -31,61 +23,68 @@ class BoxmotTracker:
         track_high_thresh: float = 0.5,
         track_low_thresh: float = 0.1,
         new_track_thresh: float = 0.6,
-        # max_time_lost = frame_rate/30 * track_buffer. At 25 fps a buffer of
-        # 90 keeps a lost track alive ~3 s, long enough to re-acquire a player
-        # who left frame during a camera pan via DINOv3 ReID instead of
-        # spawning a fresh id (cuts fragmentation ~2-3x).
         track_buffer: int = 90,
         match_thresh: float = 0.8,
         cmc_method: str = "ecc",
-        with_reid: bool = True,
-        appearance_thresh: float = 0.4,
+        max_cosine_distance: float = 0.4,
         proximity_thresh: float = 0.5,
         frame_rate: int = 30,
     ):
         from app.vendor.boxmot import BotSort
 
         logger.info(
-            f"tracker: BotSort (vendored, no torch) cmc={cmc_method} "
-            f"with_reid={with_reid} frame_rate={frame_rate}"
+            "tracker: BoT-SORT cmc=%s frame_rate=%d max_cosine_distance=%.2f",
+            cmc_method,
+            frame_rate,
+            max_cosine_distance,
         )
 
-        self._impl = BotSort(
-            reid_weights=None,
-            device=None,
-            half=False,
-            track_high_thresh=track_high_thresh,
-            track_low_thresh=track_low_thresh,
-            new_track_thresh=new_track_thresh,
-            track_buffer=track_buffer,
-            match_thresh=match_thresh,
-            proximity_thresh=proximity_thresh,
-            appearance_thresh=appearance_thresh,
-            cmc_method=cmc_method,
-            frame_rate=frame_rate,
-            with_reid=with_reid,
-        )
-        self._with_reid = with_reid
+        options = {
+            "track_high_thresh": track_high_thresh,
+            "track_low_thresh": track_low_thresh,
+            "new_track_thresh": new_track_thresh,
+            "track_buffer": track_buffer,
+            "match_thresh": match_thresh,
+            "proximity_thresh": proximity_thresh,
+            "appearance_thresh": max_cosine_distance,
+            "cmc_method": cmc_method,
+            "frame_rate": frame_rate,
+            "with_reid": True,
+        }
+        self._human_impl = BotSort(**options)
+        self._ball_impl = BotSort(**options)
+        self._track_ids: dict[tuple[int, int], int] = {}
+        self._next_track_id = 1
+
+    def _assign_track_id(self, group: int, internal_id: int) -> int:
+        key = (group, internal_id)
+        track_id = self._track_ids.get(key)
+        if track_id is None:
+            track_id = self._next_track_id
+            self._track_ids[key] = track_id
+            self._next_track_id += 1
+        return track_id
 
     def update(
         self,
-        detections: List[Detection],
+        detections: list[Detection],
         frame: np.ndarray,
-        embeddings: Optional[np.ndarray] = None,
-    ) -> List[Tuple[Detection, Optional[int]]]:
-        """Update tracker, return list of (Detection, track_id) in **input order**.
+        embeddings: np.ndarray | None = None,
+    ) -> list[tuple[Detection, int | None]]:
+        """Return detections and assigned track IDs in input order.
 
         Detections that did not match any track receive ``track_id=None``.
 
-        ``embeddings`` (optional, shape ``(N, D)``): pre-computed appearance
-        features per detection, computed externally (e.g. by an ONNX ReID
-        extractor). Required when ``with_reid=True``.
+        ``embeddings`` must contain one external OSNet feature per detection.
         """
-        if not detections:
-            self._impl.update(np.empty((0, 6), dtype=np.float32), frame)
-            return []
+        if embeddings is None:
+            if detections:
+                raise ValueError("OSNet embeddings are required for non-empty detections")
+            embeddings = np.empty((0, _EMBEDDING_DIM), dtype=np.float32)
+        if embeddings.shape != (len(detections), _EMBEDDING_DIM):
+            raise ValueError(f"embeddings must have shape ({len(detections)}, {_EMBEDDING_DIM})")
 
-        dets_np = np.array(
+        dets_np = np.asarray(
             [
                 [
                     det.bbox[0],
@@ -93,25 +92,35 @@ class BoxmotTracker:
                     det.bbox[2],
                     det.bbox[3],
                     det.confidence,
-                    det.class_id,
+                    _BALL_GROUP if det.class_id == 3 else _HUMAN_GROUP,
                 ]
                 for det in detections
             ],
             dtype=np.float32,
+        ).reshape(-1, 6)
+
+        track_ids: list[int | None] = [None] * len(detections)
+        groups = (
+            (_HUMAN_GROUP, self._human_impl),
+            (_BALL_GROUP, self._ball_impl),
         )
-
-        outputs = self._impl.update(dets_np, frame, embs=embeddings)
-        # outputs shape: (M, 8) -> [x1, y1, x2, y2, track_id, conf, cls, det_ind]
-
-        track_ids: List[Optional[int]] = [None] * len(detections)
-        for row in outputs:
-            det_ind = int(row[7])
-            if 0 <= det_ind < len(track_ids):
-                track_ids[det_ind] = int(row[4])
+        for group, implementation in groups:
+            indices = np.flatnonzero(dets_np[:, 5] == group)
+            outputs = implementation.update(
+                dets_np[indices],
+                frame,
+                embs=embeddings[indices],
+            )
+            # [x1, y1, x2, y2, track_id, confidence, class_id, detection_index]
+            for row in outputs:
+                local_index = int(row[7])
+                if 0 <= local_index < len(indices):
+                    input_index = int(indices[local_index])
+                    track_ids[input_index] = self._assign_track_id(group, int(row[4]))
 
         return list(zip(detections, track_ids))
 
 
-def make_tracker(frame_rate: int = 30, *, with_reid: bool = True) -> BoxmotTracker:
+def make_tracker(frame_rate: int = 30) -> BoxmotTracker:
     """Factory used by ``VideoProcessor.tracker_factory``."""
-    return BoxmotTracker(frame_rate=frame_rate, with_reid=with_reid)
+    return BoxmotTracker(frame_rate=frame_rate)

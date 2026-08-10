@@ -1,281 +1,266 @@
-"""Per-frame camera calibration via PnLCalib FramebyFrameCalib: keypoints +
-lines -> cam_params -> ground-plane homographies (with temporal
-stabilisation) -> observation foot points projected to pitch metres."""
+"""Pitch calibration from PnLCalib keypoints and line extremities."""
+
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import cv2
 import numpy as np
+from scipy.signal import savgol_filter
 
-from app.services.clip_state import ClipState
+from app.services.clip_state import ClipState, FrameInfo
 
 logger = logging.getLogger(__name__)
 
-
-# Field is 105 x 68 m, origin in PnLCalib is at center (-52.5..52.5, -34..34)
 PITCH_LENGTH_M = 105.0
 PITCH_WIDTH_M = 68.0
 
-# Camera-parameter EMA. Disabled (1.0) by default: heuristic_voting can flip
-# between two valid candidate calibrations on adjacent frames, and blending
-# incompatible cam_params yields a geometrically wrong camera that increases
-# jitter. Lower only if cam_params are verified stable on the clip.
-CAM_EMA_ALPHA = 1.0
-CAM_EMA_GAP_RESET = 12
-
-# Ground-homography stabilisation (the actual anti-"breathing" mechanism):
-# EMA-smooth H across frames; if a new H moves the reprojected pitch corners
-# more than H_SWITCH_PX away, treat it as a candidate switch and keep the
-# smoothed H — unless it persists H_SWITCH_MAX_REJECT frames (camera really
-# moved -> re-seed). On outright calibration failure hold the last good H up
-# to H_HOLD_FRAMES so markers don't blink.
-H_EMA_ALPHA = 0.35
-H_SWITCH_PX = 60.0
-H_SWITCH_MAX_REJECT = 6
-H_HOLD_FRAMES = 3
+# Reject solves whose reprojection error reported by the solver is clearly bad.
+REP_ERR_MAX_PX = 20.0
+# Reject a solve whose quad corners move more than this per frame since the
+# last accepted one (budget widens over unsolved gaps, capped at H_JUMP_GAP_CAP
+# frames), unless the jump persists (a real camera cut) - then accept it as
+# the new reference.
+H_JUMP_M = 5.0
+H_JUMP_GAP_CAP = 4
+H_JUMP_MAX_REJECT = 6
+# Longest hold of a homography into an unsolved gap; gaps up to twice this
+# are interpolated end to end, longer ones stay uncalibrated in the middle.
+H_HOLD_FRAMES = 6
+# Savitzky-Golay window on the quad trajectory (0.3 s at 30 fps).
+H_SMOOTH_WINDOW = 9
 
 
-_PITCH_CORNERS_W = np.array(
-    [
-        [-PITCH_LENGTH_M / 2, -PITCH_WIDTH_M / 2, 1.0],
-        [PITCH_LENGTH_M / 2, -PITCH_WIDTH_M / 2, 1.0],
-        [PITCH_LENGTH_M / 2, PITCH_WIDTH_M / 2, 1.0],
-        [-PITCH_LENGTH_M / 2, PITCH_WIDTH_M / 2, 1.0],
-    ],
-    dtype=np.float64,
-)
+def _image_quad(width: int, height: int) -> np.ndarray:
+    """Fixed image quad in the band where players actually stand."""
+    return np.array(
+        [
+            (0.20 * width, 0.55 * height),
+            (0.80 * width, 0.55 * height),
+            (0.80 * width, 0.95 * height),
+            (0.20 * width, 0.95 * height),
+        ]
+    )
 
 
-def _corner_reproj_diff(Ha: np.ndarray, Hb: np.ndarray) -> float:
-    """Mean pixel distance between the pitch corners as projected by two
-    world->image homographies. A scale-free way to compare two H matrices in
-    the units that actually matter (screen pixels)."""
-    pa = (Ha @ _PITCH_CORNERS_W.T).T
-    pb = (Hb @ _PITCH_CORNERS_W.T).T
-    wa = pa[:, 2:3]
-    wb = pb[:, 2:3]
-    if np.any(np.abs(wa) < 1e-9) or np.any(np.abs(wb) < 1e-9):
-        return float("inf")
-    pa = pa[:, :2] / wa
-    pb = pb[:, :2] / wb
-    return float(np.linalg.norm(pa - pb, axis=1).mean())
+def _quad_world(homography: np.ndarray, quad: np.ndarray) -> np.ndarray | None:
+    """Project the image quad to pitch metres; None if degenerate."""
+    points = np.hstack([quad, np.ones((4, 1))]) @ homography.T
+    if np.any(np.abs(points[:, 2]) <= 1e-9):
+        return None
+    world = points[:, :2] / points[:, 2:3]
+    return world if np.isfinite(world).all() else None
 
 
-def _ema_homography(H_prev: np.ndarray, H_new: np.ndarray, alpha: float) -> np.ndarray:
-    """Element-wise EMA of two homographies, renormalised so H[2,2] == 1."""
-    H = alpha * H_new + (1.0 - alpha) * H_prev
-    if abs(H[2, 2]) > 1e-12:
-        H = H / H[2, 2]
-    return H
-
-
-def _project_to_so3(R: np.ndarray) -> np.ndarray:
-    """Snap a (nearly-orthogonal) 3x3 matrix back to the closest SO(3)
-    rotation via SVD. Needed after EMA-blending two rotation matrices —
-    component-wise blending does not preserve orthogonality.
-    """
-    U, _, Vt = np.linalg.svd(R)
-    R_orth = U @ Vt
-    if np.linalg.det(R_orth) < 0:           # ensure right-handed
-        U[:, -1] *= -1
-        R_orth = U @ Vt
-    return R_orth
-
-
-def _ema_cam_params(prev: dict, new: dict, alpha: float) -> dict:
-    """Blend two cam_params dicts: linear EMA on scalars / vectors,
-    component-wise EMA + SO(3) re-projection on rotation matrix."""
-    def _blend_arr(a, b):
-        a = np.asarray(a, dtype=np.float64)
-        b = np.asarray(b, dtype=np.float64)
-        return alpha * b + (1.0 - alpha) * a
-
-    out = {}
-    for k in new.keys():
-        if k == "rotation_matrix":
-            R_prev = np.asarray(prev[k], dtype=np.float64)
-            R_new = np.asarray(new[k], dtype=np.float64)
-            R_blend = alpha * R_new + (1.0 - alpha) * R_prev
-            out[k] = _project_to_so3(R_blend)
-        elif k in (
-            "x_focal_length", "y_focal_length",
-        ):
-            out[k] = float(_blend_arr(prev[k], new[k]))
-        elif k in ("principal_point", "position_meters"):
-            out[k] = _blend_arr(prev[k], new[k]).tolist()
-        else:
-            out[k] = new[k]
-    return out
-
-
-def _projection_from_cam_params(cam_params: dict) -> np.ndarray:
-    x_focal = cam_params["x_focal_length"]
-    y_focal = cam_params["y_focal_length"]
-    pp = np.array(cam_params["principal_point"], dtype=np.float64)
-    pos = np.array(cam_params["position_meters"], dtype=np.float64)
-    rot = np.array(cam_params["rotation_matrix"], dtype=np.float64)
-
-    It = np.eye(4)[:-1]
-    It[:, -1] = -pos
-    K = np.array([[x_focal, 0, pp[0]], [0, y_focal, pp[1]], [0, 0, 1]], dtype=np.float64)
-    P = K @ (rot @ It)  # (3, 4)
-    return P
-
-
-def _ground_homography_from_P(P: np.ndarray) -> np.ndarray:
-    """For points on z=0 plane: image = P @ [X, Y, 0, 1]^T.
-
-    -> H_world2img = [P[:,0], P[:,1], P[:,3]] (3x3).
-    """
-    return np.stack([P[:, 0], P[:, 1], P[:, 3]], axis=1)
+def _signed_area(quad: np.ndarray) -> float:
+    x, y = quad[:, 0], quad[:, 1]
+    return 0.5 * float(x @ np.roll(y, -1) - y @ np.roll(x, -1))
 
 
 class PnLCalibrator:
-    """Per-clip calibrator. PnLCalib's FramebyFrameCalib is stateless across frames
-    (each .update overwrites internal kp/lines), so one instance per clip is fine.
+    """Calibrate one clip and project observation feet to pitch coordinates.
+
+    Per-frame homographies are gated, gap-filled and smoothed as trajectories
+    of a fixed image quad projected to pitch metres: four point pairs determine
+    a homography exactly, and metres are the units the minimap cares about.
     """
 
-    def __init__(self, frame_w: int, frame_h: int, *, refine_lines: bool = False):
+    def __init__(
+        self,
+        frame_width: int,
+        frame_height: int,
+        *,
+        refine_lines: bool = False,
+    ) -> None:
         from app.vendor.pnlcalib.utils.utils_calib import FramebyFrameCalib
 
-        # PnLCalib's iwidth/iheight is the ORIGINAL frame size; with denormalize=True
-        # it un-scales the [0,1] kp coordinates back to original frame pixels.
-        self._cam = FramebyFrameCalib(iwidth=frame_w, iheight=frame_h, denormalize=True)
-        self.refine_lines = refine_lines
-        self.frame_w = frame_w
-        self.frame_h = frame_h
-
-    def calibrate_one(
-        self,
-        kp_dict: dict,
-        lines_dict: dict,
-    ) -> Optional[dict]:
-        """Returns {cam_params, P, H_w2i, H_i2w} or None if calibration failed."""
-        try:
-            self._cam.update(kp_dict, lines_dict)
-            res = self._cam.heuristic_voting(refine_lines=self.refine_lines)
-        except Exception as exc:
-            logger.debug(f"calibrate_one: {exc}")
-            return None
-        if res is None or "cam_params" not in res:
-            return None
-
-        cam_params = res["cam_params"]
-        try:
-            P = _projection_from_cam_params(cam_params)
-            H_w2i = _ground_homography_from_P(P)
-            H_i2w = np.linalg.inv(H_w2i)
-        except Exception as exc:
-            logger.debug(f"projection failed: {exc}")
-            return None
-
-        return {
-            "cam_params": cam_params,
-            "P": P,
-            "H_w2i": H_w2i,
-            "H_i2w": H_i2w,
-        }
-
-    def _store_H(self, frame, H_w2i: np.ndarray, cam_params: Optional[dict] = None) -> None:
-        """Write a world->image homography (and its inverse) onto a frame."""
-        try:
-            H_i2w = np.linalg.inv(H_w2i)
-        except np.linalg.LinAlgError:
-            return
-        if cam_params is not None:
-            frame.cam_params = {
-                k: (v.tolist() if hasattr(v, "tolist") else v)
-                for k, v in cam_params.items()
-            }
-        frame.homography_world_to_image = (
-            H_w2i.tolist() if hasattr(H_w2i, "tolist") else H_w2i
+        self._camera = FramebyFrameCalib(
+            iwidth=frame_width,
+            iheight=frame_height,
+            denormalize=True,
         )
-        frame.homography_image_to_world = H_i2w.tolist()
+        self._refine_lines = refine_lines
+        self._quad = _image_quad(frame_width, frame_height)
+
+    def calibrate_one(self, keypoints: dict, lines: dict) -> np.ndarray | None:
+        try:
+            self._camera.update(keypoints, lines)
+            result = self._camera.heuristic_voting_ground(refine_lines=self._refine_lines)
+            if result is None or "homography" not in result:
+                return None
+            rep_err = result.get("rep_err")
+            if rep_err is not None and rep_err > REP_ERR_MAX_PX:
+                return None
+            homography = np.asarray(result["homography"], dtype=np.float64)
+            if homography.shape != (3, 3) or not np.isfinite(homography).all():
+                return None
+            return homography
+        except Exception as exc:
+            logger.debug("calibration failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _store(
+        frame: FrameInfo,
+        homography_image_to_world: np.ndarray,
+    ) -> None:
+        homography_world_to_image = np.linalg.inv(homography_image_to_world)
+        frame.homography_image_to_world = homography_image_to_world.tolist()
+        frame.homography_world_to_image = homography_world_to_image.tolist()
+
+    @staticmethod
+    def _gate(quads: list[np.ndarray | None]) -> tuple[int, set[int]]:
+        """Drop degenerate and jumping quads in place.
+
+        Returns the kept count and the indices where a persistent jump was
+        accepted as a camera cut (reseeds).
+        """
+        areas = [_signed_area(quad) for quad in quads if quad is not None]
+        if not areas:
+            return 0, set()
+        sign = 1.0 if float(np.median(areas)) >= 0 else -1.0
+        reference = float(np.median(np.abs(areas)))
+
+        last: np.ndarray | None = None
+        last_index = 0
+        rejects = 0
+        kept = 0
+        reseeds: set[int] = set()
+        for index, quad in enumerate(quads):
+            if quad is None:
+                continue
+            area = _signed_area(quad) * sign
+            if not reference / 4 <= area <= reference * 4:
+                quads[index] = None
+                continue
+            if last is not None:
+                budget = H_JUMP_M * min(index - last_index, H_JUMP_GAP_CAP)
+                if np.linalg.norm(quad - last, axis=1).max() > budget:
+                    rejects += 1
+                    if rejects <= H_JUMP_MAX_REJECT:
+                        quads[index] = None
+                        continue
+                    reseeds.add(index)
+            rejects = 0
+            last = quad
+            last_index = index
+            kept += 1
+        return kept, reseeds
+
+    @staticmethod
+    def _fill(quads: list[np.ndarray | None], reseeds: set[int]) -> list[str]:
+        """Interpolate short gaps, hold the edges of long ones.
+
+        A gap ending in a reseed is a camera cut: never interpolated, and at
+        least one frame at the junction stays "none" so smoothing and the
+        renderer treat the two sides as separate runs.
+        """
+        n = len(quads)
+        sources = ["solved" if quad is not None else "none" for quad in quads]
+        solved = [index for index in range(n) if quads[index] is not None]
+        if not solved:
+            return sources
+
+        def hold(source: int, targets: range) -> None:
+            for index in targets:
+                quads[index] = quads[source]
+                sources[index] = "held"
+
+        hold(solved[0], range(max(0, solved[0] - H_HOLD_FRAMES), solved[0]))
+        hold(solved[-1], range(solved[-1] + 1, min(n, solved[-1] + 1 + H_HOLD_FRAMES)))
+        for left, right in zip(solved, solved[1:]):
+            gap = right - left - 1
+            if gap == 0:
+                continue
+            if gap <= 2 * H_HOLD_FRAMES and right not in reseeds:
+                for index in range(left + 1, right):
+                    fraction = (index - left) / (right - left)
+                    quads[index] = (1 - fraction) * quads[left] + fraction * quads[right]
+                    sources[index] = "interp"
+            else:
+                left_end = min(left + 1 + H_HOLD_FRAMES, left + 1 + gap // 2)
+                right_start = max(right - H_HOLD_FRAMES, left_end + 1)
+                hold(left, range(left + 1, left_end))
+                hold(right, range(right_start, right))
+        return sources
+
+    @staticmethod
+    def _smooth(quads: list[np.ndarray | None]) -> None:
+        """Savitzky-Golay over each contiguous run of quads."""
+        n = len(quads)
+        start = 0
+        while start < n:
+            if quads[start] is None:
+                start += 1
+                continue
+            end = start
+            while end < n and quads[end] is not None:
+                end += 1
+            run = end - start
+            if run >= 5:
+                window = min(H_SMOOTH_WINDOW, run if run % 2 else run - 1)
+                flat = np.stack(quads[start:end]).reshape(run, 8)
+                flat = savgol_filter(flat, window, 2, axis=0, mode="interp")
+                quads[start:end] = list(flat.reshape(run, 4, 2))
+            start = end
 
     def calibrate(self, state: ClipState) -> None:
-        """Iterate frames in state, fill calibration fields, then project foot
-        points of observations into pitch coords.
+        frames = sorted(state.frames, key=lambda frame: frame.frame_idx)
+        quads: list[np.ndarray | None] = []
+        for frame in frames:
+            homography = self.calibrate_one(frame.keypoints, frame.lines)
+            quads.append(None if homography is None else _quad_world(homography, self._quad))
 
-        Camera parameters are smoothed across frames with an EMA on
-        cam_params (rotation matrix re-projected to SO(3) after blending).
-        Resets if a long gap with no successful calibration appears.
-        """
-        n_calibrated = 0          # frames with a real (non-rejected) solution
-        n_held = 0                # frames filled by holding the smoothed H
-        n_rejected = 0            # candidate-switch frames replaced by smoothed H
-        H_ema: Optional[np.ndarray] = None
-        last_good_frame: int = -10 ** 9
-        reject_run = 0
+        solved, reseeds = self._gate(quads)
+        sources = self._fill(quads, reseeds)
+        self._smooth(quads)
 
-        for frame in sorted(state.frames, key=lambda f: f.frame_idx):
-            res = self.calibrate_one(frame.keypoints, frame.lines)
-            gap = frame.frame_idx - last_good_frame
-
-            if res is None:
-                # Calibration failed entirely. Hold the last smoothed H for a
-                # short window so markers don't blink on brief dropouts.
-                if H_ema is not None and 0 < gap <= H_HOLD_FRAMES:
-                    self._store_H(frame, H_ema)
-                    n_held += 1
+        stored = 0
+        for frame, quad, source in zip(frames, quads, sources):
+            frame.homography_source = source
+            if quad is None:
                 continue
+            homography, _ = cv2.findHomography(self._quad, quad)
+            if (
+                homography is None
+                or not np.isfinite(homography).all()
+                or abs(np.linalg.det(homography)) < 1e-12
+            ):
+                frame.homography_source = "none"
+                continue
+            self._store(frame, homography)
+            stored += 1
 
-            H_raw = res["H_w2i"]
-            if H_ema is None or gap > CAM_EMA_GAP_RESET:
-                # cold start / long gap -> trust raw, reset filter
-                H_use = H_raw
-                H_ema = H_raw
-                reject_run = 0
-            else:
-                diff = _corner_reproj_diff(H_raw, H_ema)
-                if diff <= H_SWITCH_PX:
-                    H_ema = _ema_homography(H_ema, H_raw, H_EMA_ALPHA)
-                    H_use = H_ema
-                    reject_run = 0
-                else:
-                    # candidate switch / outlier
-                    reject_run += 1
-                    if reject_run >= H_SWITCH_MAX_REJECT:
-                        H_use = H_raw          # camera genuinely moved -> re-seed
-                        H_ema = H_raw
-                        reject_run = 0
-                    else:
-                        H_use = H_ema          # keep stable estimate, drop raw
-                        n_rejected += 1
-
-            self._store_H(frame, H_use, cam_params=res.get("cam_params"))
-            n_calibrated += 1
-            last_good_frame = frame.frame_idx
-
-        # Project foot points to pitch
-        n_projected = 0
-        h_by_frame = {f.frame_idx: f for f in state.frames}
-        for obs in state.observations:
-            f = h_by_frame.get(obs.frame_idx)
-            if f is None or f.homography_image_to_world is None or obs.foot_xy_image is None:
+        frame_lookup = {frame.frame_idx: frame for frame in frames}
+        projected = 0
+        for observation in state.observations:
+            frame = frame_lookup.get(observation.frame_idx)
+            if (
+                frame is None
+                or frame.homography_image_to_world is None
+                or observation.foot_xy_image is None
+            ):
                 continue
-            H = np.array(f.homography_image_to_world, dtype=np.float64)
-            pt = np.array([obs.foot_xy_image[0], obs.foot_xy_image[1], 1.0], dtype=np.float64)
-            wpt = H @ pt
-            if abs(wpt[2]) < 1e-9:
+            homography = np.asarray(frame.homography_image_to_world, dtype=np.float64)
+            point = homography @ np.asarray((*observation.foot_xy_image, 1.0), dtype=np.float64)
+            if abs(point[2]) <= 1e-9:
                 continue
-            wpt /= wpt[2]
-            x_m, y_m = float(wpt[0]), float(wpt[1])
-            # Centered coords; clip to ~field bounds with margin
-            if not (-PITCH_LENGTH_M / 2 - 5 <= x_m <= PITCH_LENGTH_M / 2 + 5):
+            pitch_x, pitch_y = point[:2] / point[2]
+            if not (-PITCH_LENGTH_M / 2 - 5 <= pitch_x <= PITCH_LENGTH_M / 2 + 5):
                 continue
-            if not (-PITCH_WIDTH_M / 2 - 5 <= y_m <= PITCH_WIDTH_M / 2 + 5):
+            if not (-PITCH_WIDTH_M / 2 - 5 <= pitch_y <= PITCH_WIDTH_M / 2 + 5):
                 continue
-            obs.pitch_xy = (x_m, y_m)
-            n_projected += 1
+            observation.pitch_xy = float(pitch_x), float(pitch_y)
+            projected += 1
 
         logger.info(
-            f"calibration: {n_calibrated}/{len(state.frames)} frames calibrated "
-            f"(+{n_held} held, {n_rejected} candidate-switches rejected), "
-            f"{n_projected}/{len(state.observations)} observations projected to pitch"
+            "calibration: solved=%d stored=%d projected=%d/%d",
+            solved,
+            stored,
+            projected,
+            len(state.observations),
         )
 
 
-def make_calibrator(frame_w: int, frame_h: int) -> PnLCalibrator:
-    return PnLCalibrator(frame_w, frame_h)
+def make_calibrator(frame_width: int, frame_height: int) -> PnLCalibrator:
+    return PnLCalibrator(frame_width, frame_height)
