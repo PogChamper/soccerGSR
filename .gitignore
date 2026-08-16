@@ -94,3 +94,9 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# GS-HOTA research sandbox: feature caches and predictions stay out
+gsr/out/
+gsr/__pycache__/
+*.gif
+.serena/

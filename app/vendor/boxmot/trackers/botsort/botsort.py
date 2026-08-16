@@ -2,10 +2,26 @@
 # the ReidAutoBackend integration. ReID is no longer built-in; pass
 # pre-computed appearance embeddings via the `embs` argument of `update()`.
 
+import os
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+# A1/A2 (occlusion-aware) levers, env-toggled for clean A/B against shipped BoT-SORT.
+_ADAPTIVE_APP = os.environ.get("BT_ADAPTIVE_APP") == "1"   # A2: mute non-discriminative appearance
+_FREEZE_EMA = os.environ.get("BT_FREEZE_EMA") == "1"       # A1: freeze appearance EMA during crossings
+_Z_THRESH = float(os.environ.get("BT_Z_THRESH", "0.06"))  # top-2 embedding-distance tie margin
+_OVERLAP_THRESH = float(os.environ.get("BT_OVERLAP", "0.35"))
+
+
+def _pairwise_iou(boxes):
+    x1 = np.maximum.outer(boxes[:, 0], boxes[:, 0]); y1 = np.maximum.outer(boxes[:, 1], boxes[:, 1])
+    x2 = np.minimum.outer(boxes[:, 2], boxes[:, 2]); y2 = np.minimum.outer(boxes[:, 3], boxes[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / np.maximum(area[:, None] + area[None, :] - inter, 1e-9)
+
 
 from app.vendor.boxmot.motion.cmc import get_cmc_method
 from app.vendor.boxmot.motion.kalman_filters.xywh import KalmanFilterXYWH
@@ -274,6 +290,15 @@ class BotSort(BaseTracker):
                 detections = [STrack(det, max_obs=self.max_obs, is_obb=self.is_obb) for det in dets_first]
         else:
             detections = []
+        if _FREEZE_EMA and len(detections) >= 2:
+            # A1: flag detections that overlap another (a crossing/occlusion) so the
+            # matched track can skip its appearance-EMA update and keep a clean bank.
+            boxes = np.array([d.xyxy for d in detections], dtype=float)
+            iou = _pairwise_iou(boxes)
+            np.fill_diagonal(iou, 0.0)
+            over = iou.max(axis=1) >= _OVERLAP_THRESH
+            for d, o in zip(detections, over):
+                d._in_overlap = bool(o)
         return detections
 
     def _separate_tracks(self):
@@ -313,6 +338,13 @@ class BotSort(BaseTracker):
 
         if self.with_reid:
             emb_dists = embedding_distance(strack_pool, detections)
+            if _ADAPTIVE_APP and emb_dists.shape[0] >= 2 and emb_dists.shape[1] > 0:
+                # A2: mute appearance for detections whose two nearest tracks are
+                # nearly tied in embedding distance (identical-kit teammate crossing);
+                # let motion/IoU decide instead of an arbitrary appearance pick.
+                s = np.sort(emb_dists, axis=0)
+                ambiguous = (s[1] - s[0]) < _Z_THRESH
+                emb_dists[:, ambiguous] = 1.0
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
             dists = np.minimum(ious_dists, emb_dists)

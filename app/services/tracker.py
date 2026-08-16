@@ -82,7 +82,8 @@ class BoxmotTracker:
         extractor). Required when ``with_reid=True``.
         """
         if not detections:
-            self._impl.update(np.empty((0, 6), dtype=np.float32), frame)
+            empty_embs = np.empty((0, 512), dtype=np.float32) if self._with_reid else None
+            self._impl.update(np.empty((0, 6), dtype=np.float32), frame, embs=empty_embs)
             return []
 
         dets_np = np.array(

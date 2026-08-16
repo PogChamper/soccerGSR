@@ -1,8 +1,11 @@
+import os
 from collections import deque
 from typing import Optional
 
 import cv2
 import numpy as np
+
+_FREEZE_EMA = os.environ.get("BT_FREEZE_EMA") == "1"  # A1: skip appearance EMA during crossings
 
 from app.vendor.boxmot.motion.kalman_filters.xywh import KalmanFilterXYWH
 from app.vendor.boxmot.trackers.botsort.basetrack import BaseTrack, TrackState
@@ -37,6 +40,7 @@ class STrack(BaseTrack):
         self.smooth_feat = None
         self.curr_feat = None
         self.alpha = 0.9
+        self._in_overlap = False  # A1: set by BotSort._create_detections on crossings
 
         # Update initial class and features
         self.update_cls(self.cls, self.conf)
@@ -246,7 +250,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xywh
         )
-        if new_track.curr_feat is not None:
+        if new_track.curr_feat is not None and not (_FREEZE_EMA and getattr(new_track, "_in_overlap", False)):
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -269,7 +273,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xywh
         )
-        if new_track.curr_feat is not None:
+        if new_track.curr_feat is not None and not (_FREEZE_EMA and getattr(new_track, "_in_overlap", False)):
             self.update_features(new_track.curr_feat)
 
         self.state = TrackState.Tracked
