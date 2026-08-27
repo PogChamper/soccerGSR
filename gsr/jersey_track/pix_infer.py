@@ -20,6 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import cv2
+import os
 import numpy as np
 import torch
 
@@ -97,7 +98,7 @@ def main() -> None:
         for fi, j, tid, _, _, _ in records:
             members[int(tid)].append((int(fi), int(j)))
         dec = fragment_decisions(model, args.device, seq, zf, manifest)
-        dd = Path("/mnt/d/jersey-lab/tracklets_v1/decisions")
+        dd = Path(os.environ.get("PIX_DEC_DIR", "/mnt/d/jersey-lab/tracklets_v1/decisions"))
         dd.mkdir(parents=True, exist_ok=True)
         json.dump({str(t): d for t, d in dec.items()}, open(dd / f"{seq}.json", "w"))
 

@@ -284,6 +284,16 @@ def cmd_train(args):
         {"params": groups["head_b"], "lr": args.lr, "weight_decay": 0.0}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs, eta_min=1e-6)
     ce = nn.CrossEntropyLoss(label_smoothing=0.05)
+    la_t = la_u = None
+    if args.logit_adjust > 0:
+        # balanced-softmax logit adjustment against the head-class prior collapse
+        ct, cu = np.ones(10), np.ones(10)
+        for t in train_tracks:
+            if t["label"] >= 0:
+                ct[t["label"] // 10] += 1
+                cu[t["label"] % 10] += 1
+        la_t = torch.log(torch.tensor(ct / ct.sum(), dtype=torch.float32)).to(device) * args.logit_adjust
+        la_u = torch.log(torch.tensor(cu / cu.sum(), dtype=torch.float32)).to(device) * args.logit_adjust
     n_pos = sum(1 for t in train_tracks if t["label"] < 0)
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor((len(train_tracks) - n_pos) / max(n_pos, 1)).to(device))
     scaler = torch.amp.GradScaler(enabled=device == "cuda")
@@ -303,14 +313,18 @@ def cmd_train(args):
                 known = absent.to(device) < 0.5
                 loss = bce(a, absent.to(device))
                 if known.any():
-                    loss = loss + ce(t[known], tens.to(device)[known]) + ce(u[known], units.to(device)[known])
+                    tl = t[known] + la_t if la_t is not None else t[known]
+                    ul = u[known] + la_u if la_u is not None else u[known]
+                    loss = loss + ce(tl, tens.to(device)[known]) + ce(ul, units.to(device)[known])
                     # per-crop supervision on trunk tokens: the track label broadcast
                     # to every real crop of known tracks (kit-diverse crops included)
                     km = known[:, None] & ~mask & (vs >= 0.7)
                     if km.any():
+                        tcl = tc[km] + la_t if la_t is not None else tc[km]
+                        ucl = uc[km] + la_u if la_u is not None else uc[km]
                         loss = loss + args.aux_w * (
-                            ce(tc[km], tens.to(device)[:, None].expand_as(km)[km]) +
-                            ce(uc[km], units.to(device)[:, None].expand_as(km)[km]))
+                            ce(tcl, tens.to(device)[:, None].expand_as(km)[km]) +
+                            ce(ucl, units.to(device)[:, None].expand_as(km)[km]))
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -367,6 +381,7 @@ def main():
     tr.add_argument("--no-external", dest="external", action="store_false")
     tr.add_argument("--aux-w", type=float, default=1.0)
     tr.add_argument("--trunk-lr-mult", type=float, default=0.1)
+    tr.add_argument("--logit-adjust", type=float, default=0.0)
     tr.add_argument("--two-head", action="store_true")
     tr.add_argument("--eval-from", type=int, default=2)
     tr.add_argument("--eval-every", type=int, default=2)

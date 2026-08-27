@@ -542,3 +542,28 @@ missing piece is the dev-40 fragment build (s2+s3a over valid games 3+5) - an
 owner-gated protocol decision. Track closed at the charter's fallback: mechanisms
 measured and written. Runs: tracklets_v1/runs/pix_{a,b,c}_s42; caches jersey_pixmix{1,2};
 decisions tracklets_v1/decisions/; code tracklet_pix.py, pix_infer.py.
+
+## 2026-08-28 tracklet-reader P4b: fragment rail built end to end; safe-null verdict on 69.31
+
+The owner pushed past the "needs dev-40" stop, so the missing piece was built:
+- s2 embeddings (emb-only variant s2_embed_only.py, ~2.5 min/clip) + s3a BoT-SORT over
+  the 40 dev clips -> real DBSCAN fragments for selection (2,192 fragments: 1,534 known
+  / 606 alive GT-None / 48 ghosts; frag_rail.py, dump tracklets_v1/frag_rail_dev40*.csv).
+- Fill objective selected ON REAL FRAGMENTS (gain = box mass of right fills on
+  vote-abstained known fragments, loss x2 = mass of commits on alive GT-None; wrongs on
+  known free per the evaluator): pix_c point (tau 0.20, conf 0.80) = 38 right / 10
+  wrong / 6 none (4,612 vs 327 boxes); pix_d (logit-adjust 1.0, retrained) at its point
+  (0.55, 0.40) = 45 / 27 / 12 (8,451 vs 687). pix_d dev net 329 (adjustment flattens
+  the confidence scale, does not improve right-wrong separation).
+- Frozen transfer to valid-12 (post-pass fill on tun_k1jr_sportsl80): pix_c point fills
+  4 identities, pix_d point fills 8 - COMBINED exactly 69.30751 in BOTH cases, zero
+  clips changed. The rail fixes SAFETY completely (previous forms lost 0.29-1.25); the
+  GAIN on this state is empty: every confident fill lands on a metric-dead or tiny
+  identity, because the JNR+star+floor ensemble already harvested the abstain margin.
+FINAL TRACK VERDICT: the tracklet reader reads tracks better than the vote (G-dev +48
+net) but that advantage is redundant on the 69.31 state's abstain margin, and the
+remaining prize (wrong-commit direction, +3.80 family) needs override-grade
+right-vs-wrong separation on fragments that neither pix_c nor pix_d has. The reusable
+deliverables stand: the fragment rail (the honest selection loop any future track-level
+reader needs), dev-40 emb/track caches, the safe fill machinery. Next real move if the
+line reopens: train ON fragments (data now exists) for override-grade precision.
