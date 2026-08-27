@@ -364,3 +364,181 @@ assembler itself is +7.2 HOTA over raw BoT-SORT (18/20 clips up, median +4.7). /
 - Chain composition results recorded in clipcalib journal 2026-08-27 and
   ltpi-research/results/bt3_valid_chain/README.md: 69.06 + SportsL links = 69.31,
   4 up / 0 down, first conjunction-significant candidate on valid-12.
+
+## 2026-08-27 tracklet-reader P0 rails: generic per-track harness, exact 69.31 profile
+
+- `analysis/jersey-2026-08-17/jersey-error-decomp/oracle_assoc.py` replays both jersey cache
+  formats. The branch is picked from the arity of a frame entry, the way the assembler picks
+  GSR_JERSEY_FMT: 3-tuple (vis, tens, units) = ConvNeXt logits, 2-tuple (numbers, confs) =
+  generic reader. The generic branch is the assembler's own rule (s3b_splitfix.py frag_votes /
+  decode_votes): accept a crop when number >= 0 and conf >= CONF_TH, vote weight = conf,
+  commit = argmax of the weighted counts when nv >= MIN_VOTES. No GSR_MIN_VOTE_FRAC floor -
+  the harness scores GT tracks, not assembled identities. VIS_TH is inert in that branch.
+  Valid-12, perfect association (best GT IoU >= 0.5), 187 known-jersey GT player tracks:
+  | reader | hit | wrong | miss | false commit (of 50 GT-None tracks) |
+  |---|---|---|---|---|
+  | jersey.pkl logits, VIS 0.7 / CONF 0.95 / MV 6 | 156 | 19 | 12 | 8 |
+  | jnrstar2_u02_c08 generic, CONF 0.5 / MV 6 | 165 | 16 | 6 | 9 |
+  The logits row is bit-identical to the pre-change run (the recorded 156/19/12, FC 8), so the
+  branch is additive. The 69.06 reader is +9 hits / -3 wrong / -6 miss for +1 false commit, and
+  all 6 of its misses are "conf killed it" - that format has no visibility gate to blame.
+- `vote_profile.py` (new, fork of vote_density.py; the original is untouched). Two fixes:
+  identities whose boxes match no GT box at IoU >= 0.5 are no longer scored as false commits on
+  a GT-None identity (unmatched_commit vs false_commit, and the same split on the abstain side),
+  and the vote-density floor is `--floor` instead of a hardcoded ladder. `--compose-tag` pools
+  the dump identities through a later tree (dump row i is composed prediction i for i < len(rows))
+  and takes the committed jersey from there, so one pass profiles the pre-link and the composed
+  state. Run: `--dump-dir /mnt/d/jersey-lab/chain_compose/dump_k1jr --cache jnrstar2_u02_c08
+  --conf 0.5 --floor 0.02 --compose-tag tun_k1jr_sportsl80`.
+- Exact error profile of the 69.31 state (identities / boxes; player and goalkeeper roles,
+  114,882 dump rows of 123,885). base = the dump = tun_k1jr_g0 = 69.06; composed = the same
+  identities pooled through tun_k1jr_sportsl80 = 69.31:
+  | class | base ids | base boxes | composed ids | composed boxes | box share |
+  |---|---|---|---|---|---|
+  | right | 162 | 78,144 | 162 | 78,376 | 68.22 % |
+  | wrong | 20 | 7,457 | 20 | 7,457 | 6.49 % |
+  | false_commit (GT jersey None) | 8 | 2,388 | 8 | 2,388 | 2.08 % |
+  | unmatched_commit (no GT match) | 0 | 0 | 0 | 0 | 0 % |
+  | abstain_known | 48 | 7,201 | 46 | 6,969 | 6.07 % |
+  | abstain_none | 70 | 19,669 | 70 | 19,669 | 17.12 % |
+  | abstain_unmatched | 2 | 23 | 2 | 23 | 0.02 % |
+  | total | 310 | 114,882 | 308 | 114,882 | |
+  /mnt/d/jersey-lab/tracklets_v1/profile_6931.csv, per-identity detail in
+  profile_6931_identities.csv. The 996 interpolated rows of the composed tree (0.8 % of 124,881)
+  are outside the dump alignment and not counted.
+  Readings: (1) the split was worth making but binds on nothing here - all 8 false commits are
+  real GT-None identities, so the old vote_density number was right by luck; (2) SportsL buys
+  exactly two abstain_known fragments, absorbed into an already-right identity - SNGS-026 base
+  id 14, 198 boxes, GT 14, and SNGS-031 base id 71, 34 boxes, GT 11 - 232 boxes in all, and it
+  touches no wrong and no false commit; (3) all 15 goalkeeper identities are abstain_none, and
+  the remaining 55 abstain_none are player identities matched to GT-None tracks; (4) at floor
+  0.02 no committed identity sits below the floor, which re-confirms the dump was built with
+  GSR_MIN_VOTE_FRAC=0.02 (floor 0.05 would take 18 identities: 14 right, 4 wrong).
+  9 of the 20 wrong are tens-digit errors with the units right (42->12 x2, 23->3 x2, 14->4 x2,
+  15->5, 28->18, 33->13); the largest single wrong identity is SNGS-023 id 52, 657 boxes, read 14
+  for GT 11.
+- `clipcalib/tools/tune_gsr.py` LEVERS: added GSR_MIN_VOTE_FRAC and GSR_JERSEY_FMT. Journal rows
+  were dropping both, which is why the k1jr_g0 config cell needed a prose note to say the state
+  is generic-format at floor 0.02.
+
+## 2026-08-27 tracklet-reader P1: tracklet dataset v1
+
+One script, three subcommands, all CPU and skip-if-exists per clip:
+`gsr/jersey_track/build_tracklets.py {logits,crops,manifest}` (base conda python, numpy/cv2/pandas).
+Detector-to-GT matching is `mine_train_crops.match_seq(split, seq, 0.5)` unchanged.
+Output root /mnt/d/jersey-lab/tracklets_v1, 147 MB in 21,024 files. Wall time 3.3 min total.
+
+- `logits --split train` (41 s, 57 npz, 60.1 MB) -> logits_train/<seq>.npz. Per clip: the matched
+  group `m_*` (frame, det, track, role, vis logit, tens[10], units[10], xyxy, det conf, IoU,
+  scored flag) sorted by (track, frame) so every GT track is a contiguous slice; the unmatched
+  group `u_*` with the same per-detection fields (the abstain-side distribution at inference);
+  the track index `t_*` (track, role, label with -1 for GT-None, GT box count, slice start/end)
+  covering every player/gk GT track including those with zero matched detections; plus
+  `image_ids` for frame_idx -> image_id.
+  631,548 player/gk detections, 608,214 matched / 23,334 unmatched, 1,224 GT tracks.
+- `logits --split valid --seqs valid12` (8 s, 12 npz, 11.4 MB) -> logits_valid12/.
+  119,360 detections, 113,667 matched / 5,693 unmatched, 251 tracks, 187 known player tracks -
+  the same 187 the P0 per-track harness scores.
+- `crops --seqs tail17` (2 min 24 s, 20,936 jpg quality 95, 75.1 MB) -> crops_tail17/<seq>_<track>/
+  <seq>_<image_id>.jpg plus index.csv (seq, track_id, image_id, path, gt_jersey, role, team, w, h)
+  and _index/<seq>.csv as the resume marker. GT player boxes (category 1) of SNGS-154..170 on
+  frames 1, 9, 17 ... 745 - the same 94 frames per clip the ltpi cache uses. 335 player tracks,
+  269 with a number and 66 GT-None; 14 boxes skipped as under 4x8 px; crop height median 101 px
+  against 100 px in the pool, so the two sources are the same sampling.
+- `manifest` (0.6 s) -> manifest_tracks.csv, 1,224 rows (seq, gt_track, label, role, n_boxes_gt,
+  n_dets_matched, n_crops_stride8, crop_source).
+
+Totals over the 57 train clips (MEASURED, manifest_tracks.csv):
+
+| class | tracks | GT boxes | matched dets | stride-8 crops |
+|---|---|---|---|---|
+| player, known number | 933 | 512,009 | 496,314 | 64,122 |
+| player, GT-None | 212 | 92,962 | 88,891 | 11,636 |
+| goalkeeper | 79 | 24,107 | 23,009 | 0 |
+
+933 known and 212 None hit the recon targets exactly, and 512,009 GT boxes / 496,314 supervised
+detections reproduce the charter's two independent counts. Crop sources: 865 tracks from the pool
+(40 clips), 359 from crops_tail17 (17 clips). 81 tracks carry no stride-8 crop: the 79 goalkeepers
+(neither source cuts them) and two 4- and 5-box GT-None player tracks (SNGS-110 track 16,
+SNGS-112 track 26) that never land on a sampled frame. Detector recall against GT is 96.9 % of
+boxes on known player tracks; the shortest known player track has 7 crops, the median 73.
+
+Verdict: P1 (a), (b), (d) done. (c), the dev-split logits for the 40 valid clips, waits on the
+running s1 pass over SNGS-039..059 / 078..096.
+
+## 2026-08-27 tracklet-reader P2: feature-level v0 CLOSED NEGATIVE (the control did its job)
+
+- Rails: dev-40 full-rate logits built after the s1 pass (40 clips, 464,290 dets,
+  691 known / 101 None player tracks, tracklets_v1/logits_dev40). Incumbent on this
+  rail (unweighted s3b vote VIS0.7/CONF0.95/MV6): 521 hit / 44 wrong / 126 miss,
+  FC 15, net 462. Ungated poolings are far negative (-210..-326), as recorded.
+- v0a (transformer d96 x2 over per-det ConvNeXt softmax + geometry, fragment-window
+  augmentation, tau swept on dev): best dev net 397 (tau 0.7: 495/96/100 FC 19).
+- v0b (+ the gate decision and its track rate as input features, tau grid x8):
+  best dev net 407; wrongs drop 96 -> 66 but hits stay ~470.
+- VERDICT: G-dev (net >= 477 at FC <= 15) failed by 55-65 net on both variants.
+  Mechanism: the gated vote's precision comes from hard evidence selection; a
+  learned reweighting of the SAME per-crop posteriors converts misses into wrongs
+  because on hard tracks the posteriors are systematically wrong (88.5 percent of
+  accepted crops wrong on wrong tracks, recorded 2026-08-17). No feature-level
+  model can change what the evidence says. 933 known tracks is also thin for a
+  100-class readout. Feature-level arm CLOSED; per charter the pixel arm proceeds -
+  its premise (sub-threshold pixel glimpses integrated across crops) is exactly
+  what v0 cannot see.
+- Runs: tracklets_v1/runs/v0{a,b}_s42 (best.pt, last.pt); code tracklet_v0.py
+  (train/eval/baselines; the baselines subcommand is the standing incumbent rail).
+
+## 2026-08-27 tracklet-reader P3: pixel arm PASSES G-dev as a vote-first hybrid
+
+Iteration ladder on the dev split (691 known / 101 None player tracks; incumbent
+unweighted vote 521/44/126 FC 15, net 462; gate net >= 477 at FC <= 15):
+- pix_a (ConvNeXt-T + cross-crop transformer + tied-digit head, track-level CE only):
+  net -110. Train 870/933 vs dev 230/691 = kit memorisation of the 3 train matches.
+- pix_b (+ per-crop aux loss on trunk tokens, + external kit-diverse mix
+  jersey-2023/soccer_crops ~8k crops, + trunk LLRD x0.1, stronger colour augs):
+  net 243 (415/167 FC 5). Memorisation broken, precision still short.
+- pix_c (aux loss only on vis_p >= 0.7 crops - stop teaching hallucination on backs;
+  eval selection top-K=16 by vis_p, train pick half top-vis half random):
+  net 384 (ep 34: 524/120/47 FC 20). HITS NOW EXCEED THE VOTE (524-531 vs 521);
+  the whole残 gap is commit precision.
+- Decision-rule layer (no training): abstain if absent > tau OR digit conf < c;
+  conf separates (right median 0.885 vs wrong 0.517). Grid on dev: net 418
+  (472/47/172 FC 7) at tau 0.10 / conf 0.55.
+- HYBRID (the recorded winning shape, vote-first + fill): vote where it commits,
+  else pix_c at (tau 0.10, conf 0.50): net 504 (566/53/72 FC 9). Pix-override
+  variant (model overrides the vote at conf >= 0.87): net 510 (569/50/72 FC 9).
+  G-dev PASSED. All thresholds selected on dev; valid-12 untouched.
+Artifacts: tracklets_v1/runs/pix_{a,b,c}_s42/ (best.pt, dev_dump.npz for c);
+code tracklet_pix.py. Next: P4 - fragment-level inference on valid-12, priority-merge
+generic cache (jnrstar2 reads + model fills), chain vs 69.31; 3 seeds.
+
+## 2026-08-27 tracklet-reader P4: chain integration NEGATIVE with a full mechanism; track closed
+
+Three integration forms of the G-dev-passing hybrid (thresholds frozen on dev), all
+measured against the 69.31 composed state (tun_k1jr_sportsl80):
+- merge-cache with overrides (pix_infer.py, jersey_pixmix1): 68.06 (+SportsL). 71
+  overrides at conf >= 0.87 mostly agree with GT, but the killers repeat the recorded
+  per-crop confusions ON FRAGMENTS at high confidence: 19->10 three times (the "10"
+  training-prior collapse), 14->4 (tens drop), None->1.
+- fill-only cache (jersey_pixmix2): 68.60. 21 fills; SNGS-021 -4.23 via the
+  ASSOCIATION AMPLIFIER: a wrong or false fragment commit merges by (team, jersey)
+  into a real player identity and poisons hundreds of boxes; the dev rail cannot see
+  this by construction.
+- post-pass fill on the emitted tree (no merge exposure): 69.02 (-0.29). 17 identities
+  filled; 16 are metric-zero (most filled GT-None identities are already METRIC-DEAD -
+  team or role mismatched, so jersey is irrelevant - and the alive known-but-abstained
+  identities the model commits on are tiny fragments); the sign is set by ONE alive
+  GT-None identity (SNGS-032 id 57, 491 boxes, fill "8", -3.67).
+- G-track rail (oracle_assoc generic, detector crops): pixmix2 163/18/6 FC 10 vs
+  incumbent 165/16/6 FC 9 - gate (>= 170, FC <= 9) not met.
+- Box-weighted re-selection of the fill point on dev says "fill more" (GT-None box
+  mass on dev is small) - the dev split, being GT tracks, structurally lacks the two
+  populations that decide the chain outcome: DBSCAN fragments and ghost identities.
+VERDICT: the pixel tracklet reader is a real track-level advance (G-dev net 510 vs
+462, hits 569 vs 521, FC 9 vs 15) but its chain integration on this state is negative;
+converting track-level reading gains into GS-HOTA needs fragment-level selection data
+that neither valid-12 (selection budget spent) nor dev-as-GT-tracks can provide. The
+missing piece is the dev-40 fragment build (s2+s3a over valid games 3+5) - an
+owner-gated protocol decision. Track closed at the charter's fallback: mechanisms
+measured and written. Runs: tracklets_v1/runs/pix_{a,b,c}_s42; caches jersey_pixmix{1,2};
+decisions tracklets_v1/decisions/; code tracklet_pix.py, pix_infer.py.
