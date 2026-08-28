@@ -567,3 +567,58 @@ right-vs-wrong separation on fragments that neither pix_c nor pix_d has. The reu
 deliverables stand: the fragment rail (the honest selection loop any future track-level
 reader needs), dev-40 emb/track caches, the safe fill machinery. Next real move if the
 line reopens: train ON fragments (data now exists) for override-grade precision.
+
+## 2026-08-28 (night) SoccerFactory jersey stream: pre-registered audit run, gate met via star confirmation
+
+- 300-crop visual audit (4 Opus vision graders, every crop graded twice, disagreement 21%),
+  sample: parts 1-2, 160 clips, numbered boxes at authors' legibility >= 0.5, median h 133 px.
+  RAW verdicts: A 171 / B 63 / C 62 / D 4 -> A+B 78% (gate >= 90% FAILED), D 1.3% (gate <= 2%
+  passed). The failure is illegibility, not wrong labels; legibility thresholding cannot fix it
+  (A+B 86% even at leg >= 0.9; curve in the workflow record wf_651b6c5f-099).
+- CONFIRMATION FILTER (the recorded 45.2->76.9 route, star v2 as the confirmer): keep if
+  leg >= 0.8 AND star v2 reads the SAME number at conf >= 0.5. On the audited crops: kept
+  198/241 (yield 82%), A+B 91.4%, D 0.0% - GATE MET for the filtered stream.
+- Night launch: sf_mine.py (5 CPU shards, leg 0.8, cap 40/clip, <= 1 crop of a number per
+  second) over the 2,000 part-1/2 clips -> sf_confirm.py (star ONNX, CPU). Output
+  /mnt/d/jersey-lab/sf_mine_v1/{crops,manifests,confirmed}. Purpose: kit-diversity single-crop
+  stream (~500 games) for star_v3 and pix_e retrains - match diversity is the one axis with a
+  recorded large win (81.96 -> 94.16) and it just moved pix_a -> pix_b by +353 dev net.
+- Parallel GPU night chain: s2_calib_only (PnLCalib cameras, dev-40) -> jnr_all (dev-40) -
+  the legs for an apply-only transfer check of the 67.26 / 69.06 / 69.31 configs on 40 fresh
+  clips of 2 games before any test exposure. Camera source moves the assembler by +-0.3 only
+  (FIFA measurement), adequate for an identity-knob check.
+
+## 2026-08-28 (night) dev-40 transfer check: the jersey candidate's gain TRANSFERS (n=3 games now)
+
+Apply-only replays on the 40 never-tuned valid clips (games 3+5), all knobs frozen from
+the valid-12 selections; PnLCalib cameras (calib.pkl), no k1 - deltas are the answer,
+absolutes are not comparable to the bt5k chain. Journal rows dev_base / dev_hy / dev_jr;
+perseq tun_dev_*.json.
+- base (OCR 0.95): 52.24. JNR+ConvNeXt hybrid: 54.47. jersey 69.06-config
+  (jnrstar2 + floor 0.02): 56.03.
+- Paired per-clip stats vs base: hybrid +2.14, CI [+1.17, +3.16], game3 +3.58 / game5
+  +0.55, 23 up / 3 down, worst SNGS-095 -3.40. Jersey config +3.77, CI [+2.29, +5.36],
+  game3 +6.19 / game5 +1.10, 28 up / 7 down, worst SNGS-095 -4.68.
+- VERDICT: the jersey candidate's gain is not a one-match artifact - CI excludes zero on
+  two unseen games, positive in both, ordering (jersey > hybrid > base) preserved. This
+  was the missing evidence for the pending apply-only test exposure of the 69.31 chain.
+  Caveats: different camera rail (deltas only), real between-game heterogeneity (game5
+  ~3x weaker), 7 of 40 clips negative with worst -4.68 - the test-side do-no-harm
+  expectation should be set accordingly.
+- Legs built this night and now standing assets: calib.pkl (PnLCalib) 40/40,
+  /mnt/d/jersey-lab/jnr_dev40 (label-free JNR, 40/40), star_v2_dev caches 40/40,
+  jersey_{jnrmix_u02w2,jnrstar2_u02_c08}.pkl on all 40 dev clips.
+
+## 2026-08-28 (night) star_v3 (SoccerFactory diversity): crop-level gain, chain-level null - closed
+
+- Trained with the confirmed SF stream (36,980 crops, class cap 1500) added to the star v2
+  recipe (gsr_star_v3.yaml, model.num_classes=11; one false start without that override).
+  Dev-val (games 3+5 crops) number_acc 78.7 vs v2's 77.1 (+1.6 pp on the same selection split).
+- Chain, frozen knobs: valid-12 69.31-form with jnrstar3 = 69.36 (+0.05, noise); dev-40
+  jersey config 55.67 vs 56.03 (-0.36 ON THE SAME GAMES whose crops got more accurate).
+  The per-crop-vs-vote trap reproduced again (blend v1f pattern, milder). VERDICT: SF kit
+  diversity does not convert through the current vote layer at frozen thresholds; the SF
+  stream stands as a clean asset (audit-gated) for future readers; per-knob re-sweeps for
+  v3 not attempted (would be dev-selection work for a sub-noise prize).
+- Assets: /mnt/d/jersey-lab/runs/star_v3 (ckpt + reader.onnx), jersey_star_v3* and
+  jersey_jnrstar3_u02_c08.pkl caches on valid-12 and dev-40.
