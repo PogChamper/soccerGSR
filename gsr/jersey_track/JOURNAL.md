@@ -622,3 +622,17 @@ perseq tun_dev_*.json.
   v3 not attempted (would be dev-selection work for a sub-noise prize).
 - Assets: /mnt/d/jersey-lab/runs/star_v3 (ckpt + reader.onnx), jersey_star_v3* and
   jersey_jnrstar3_u02_c08.pkl caches on valid-12 and dev-40.
+
+## 2026-08-28 (night, addendum) star_v3 re-selected on the dev-40 chain rail: the splits disagree
+
+Caught my own protocol miss: the star_v3 null verdict above used INHERITED v2 knobs
+("never inherit a confidence threshold across models"). Re-selected on the dev-40 chain
+rail (a legitimate selection split; 8 configs, journal rows dsw_*): best is conf 0.5 /
+floor 0.02 at 56.34 - ABOVE the v2 config's 56.03 there. Applied apply-only to valid-12
+(69.31 form): 67.70, well below v2's 69.31. So dev-40 prefers v3, valid-12 prefers v2:
+the reader sub-choice is game-dependent at a scale larger than the v2-v3 gap, and with
+n=3 games it is UNRESOLVABLE. What stays resolved on both rails: the config family
+(JNR-first + star fill + floor >> base, and > hybrid). Standing verdict: v2 remains the
+incumbent by valid-12 precedent; v3 files as equivalent-within-game-noise with a clean
+data asset behind it. Any future reader adjudication needs more games (the dev-40 rail
+now makes that routine).
